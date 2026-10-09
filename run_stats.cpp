@@ -915,13 +915,14 @@ bool run_stats::save_csv(const char *filename, benchmark_config *config)
 
 void run_stats::debug_dump(void)
 {
-    benchmark_debug_log("run_stats: start_time={%u,%u} end_time={%u,%u}\n", m_start_time.tv_sec, m_start_time.tv_usec,
-                        m_end_time.tv_sec, m_end_time.tv_usec);
+    benchmark_debug_log("run_stats: start_time={%lld,%lld} end_time={%lld,%lld}\n", (long long) m_start_time.tv_sec,
+                        (long long) m_start_time.tv_usec, (long long) m_end_time.tv_sec,
+                        (long long) m_end_time.tv_usec);
 
     for (std::list<one_second_stats>::iterator i = m_stats.begin(); i != m_stats.end(); i++) {
         benchmark_debug_log(
             "  %u: get latency=%u.%ums, set latency=%u.%ums, wait latency=%u.%ums"
-            "m_ops_set/get/wait=%u/%u/%u, m_bytes_set/get=%u/%u, m_get_hit/miss=%u/%u\n",
+            "m_ops_set/get/wait=%llu/%llu/%llu, m_bytes_set/get=%llu/%llu, m_get_hit/miss=%u/%u\n",
             i->m_second, USEC_FORMAT(AVERAGE(i->m_get_cmd.m_total_latency, i->m_get_cmd.m_ops)),
             USEC_FORMAT(AVERAGE(i->m_set_cmd.m_total_latency, i->m_set_cmd.m_ops)),
             USEC_FORMAT(AVERAGE(i->m_wait_cmd.m_total_latency, i->m_wait_cmd.m_ops)), i->m_set_cmd.m_ops,
@@ -1893,9 +1894,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting("Runtime");
-        const unsigned long long start_time_ms =
-            ((long long) m_start_time.tv_sec * 1000000 + m_start_time.tv_usec) / 1000;
-        const unsigned long long end_time_ms = ((long long) m_end_time.tv_sec * 1000000 + m_end_time.tv_usec) / 1000;
+        const long long start_time_ms = ((long long) m_start_time.tv_sec * 1000000 + m_start_time.tv_usec) / 1000;
+        const long long end_time_ms = ((long long) m_end_time.tv_sec * 1000000 + m_end_time.tv_usec) / 1000;
         jsonhandler->write_obj("Start time", "%lld", start_time_ms);
         jsonhandler->write_obj("Finish time", "%lld", end_time_ms);
         jsonhandler->write_obj("Total duration", "%lld", end_time_ms - start_time_ms);

@@ -727,8 +727,8 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("verify_only", "\"%s\"", cfg->verify_only ? "true" : "false");
     jsonhandler->write_obj("generate_keys", "\"%s\"", cfg->generate_keys ? "true" : "false");
     jsonhandler->write_obj("key_prefix", "\"%s\"", cfg->key_prefix);
-    jsonhandler->write_obj("key_minimum", "%11u", cfg->key_minimum);
-    jsonhandler->write_obj("key_maximum", "%11u", cfg->key_maximum);
+    jsonhandler->write_obj("key_minimum", "%11llu", cfg->key_minimum);
+    jsonhandler->write_obj("key_maximum", "%11llu", cfg->key_maximum);
     jsonhandler->write_obj("key_pattern", "\"%s\"", cfg->key_pattern);
     jsonhandler->write_obj("key_stddev", "%f", cfg->key_stddev);
     jsonhandler->write_obj("key_median", "%f", cfg->key_median);
