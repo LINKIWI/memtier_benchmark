@@ -340,6 +340,9 @@ private:
     // --transaction rotation this connection drives to close its MULTI.
     bool setup_held_for_transaction();
     void send_conn_setup_commands(struct timeval timestamp);
+    // Schedule a fill on every other connected connection of this client, so
+    // that those held in hold_pipeline() re-check it.
+    void wake_peers(void);
 
     // True iff any peer connection on this client is still climbing the
     // setup ladder (TCP-up or in-progress, but not yet ready for reads).
