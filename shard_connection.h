@@ -164,6 +164,7 @@ public:
     // allows another attempt, schedule a reconnect with backoff; otherwise
     // end this thread.
     void attempt_reconnect(const char *error_context);
+    void reconnect_after_setup_error(const char *error_context);
 
     void send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout);
     void send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value, int value_len,
@@ -432,6 +433,8 @@ private:
     double m_current_backoff_delay;
     struct event *m_reconnect_timer;
     bool m_reconnecting;
+    // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
+    bool m_setup_rejected;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;

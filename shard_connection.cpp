@@ -262,6 +262,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_current_backoff_delay(1.0),
         m_reconnect_timer(NULL),
         m_reconnecting(false),
+        m_setup_rejected(false),
         m_connection_timeout_timer(NULL),
         m_retry_queue(NULL),
         m_replay_queue(NULL),
@@ -523,6 +524,7 @@ int shard_connection::connect(struct connect_info *addr)
         m_reconnect_timer = NULL;
     }
     m_reconnecting = false;
+    m_setup_rejected = false;
 
     // Start connection timeout timer (only if enabled)
     if (m_config->connection_timeout > 0) {
@@ -645,6 +647,7 @@ void shard_connection::disconnect()
     // reconnect timer (the timer was freed above), leaving m_reconnecting
     // true would make every future attempt_reconnect call no-op silently.
     m_reconnecting = false;
+    m_setup_rejected = false;
 
     // by default no need to send any setup request
     m_authentication = setup_done;
@@ -1224,6 +1227,7 @@ void shard_connection::process_response(void)
                     snprintf(buf, sizeof(buf), "AUTH failed: %s", r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
+                reconnect_after_setup_error("AUTH error");
                 error = true;
             } else {
                 m_authentication = setup_done;
@@ -1238,6 +1242,7 @@ void shard_connection::process_response(void)
                     snprintf(buf, sizeof(buf), "SELECT failed: %s", r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
+                reconnect_after_setup_error("SELECT error");
                 error = true;
             } else {
                 benchmark_debug_log("database selection successful.\n");
@@ -1320,6 +1325,7 @@ void shard_connection::process_response(void)
                     snprintf(buf, sizeof(buf), "HELLO failed: %s", r->get_status() ? r->get_status() : "");
                     report_connection_stage_failure(buf);
                 }
+                reconnect_after_setup_error("HELLO error");
                 error = true;
             } else {
                 m_hello = setup_done;
@@ -1416,9 +1422,7 @@ void shard_connection::process_response(void)
                 // counter to setup-ladder lifetime instead. Idempotent —
                 // subsequent successful responses just re-assign 0.
                 if (m_reconnect_attempts > 0) {
-                    benchmark_debug_log(
-                        "Setup ladder + first response succeeded after %u reconnection attempts; resetting counter.\n",
-                        m_reconnect_attempts);
+                    benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
                 }
                 m_reconnect_attempts = 0;
             } else {
@@ -1848,6 +1852,21 @@ void shard_connection::attempt_reconnect(const char *error_context)
     }
 }
 
+// A setup step (AUTH/SELECT/HELLO) was rejected. With --reconnect-on-error,
+// handle it like a dropped connection, so --max-reconnect-attempts bounds it.
+// Leaving the connection open would stall it for good: no workload request is
+// sent before setup completes, so --test-time / --requests are never checked
+// again, and --connection-stage-timeout is disarmed once the run has reached
+// steady state. Without --reconnect-on-error, a failure at startup is ended by
+// --connection-stage-timeout.
+void shard_connection::reconnect_after_setup_error(const char *error_context)
+{
+    if (m_config->reconnect_on_error) {
+        attempt_reconnect(error_context);
+        m_setup_rejected = m_reconnecting;
+    }
+}
+
 void shard_connection::handle_reconnect_timer_event()
 {
     // Clean up the timer
@@ -1857,6 +1876,23 @@ void shard_connection::handle_reconnect_timer_event()
     }
 
     m_reconnecting = false;
+
+    // The server rejected a setup step on the last connection and the run's
+    // time is up: stop retrying. With unlimited attempts the setup would keep
+    // failing and the thread would never end. The client is left unended, so
+    // the run fails as incomplete. This applies even with requests held for
+    // replay: they are only resent after a setup that keeps failing.
+    // disconnect_all() counts them as errors. finished() is only meaningful
+    // once the run has started (a response was answered).
+    const bool setup_rejected = m_setup_rejected;
+    m_setup_rejected = false;
+    if (setup_rejected && m_conns_manager->get_reqs_answered() && m_conns_manager->finished()) {
+        benchmark_error_log("Connection setup failed and the run is over, not reconnecting.\n");
+        if (m_conns_manager->all_connections_idle()) {
+            m_conns_manager->disconnect_all();
+        }
+        return;
+    }
 
     // Attempt to reconnect
     int ret = m_conns_manager->reconnect(m_id);
@@ -1921,12 +1957,13 @@ void shard_connection::handle_reconnect_timer_event()
         benchmark_error_log("Reconnection attempt %u: requested a cluster slot map refresh to reconnect.\n",
                             m_reconnect_attempts);
     } else {
-        benchmark_error_log("Reconnection successful after %u attempts.\n", m_reconnect_attempts);
-        // State reset (m_reconnect_attempts, m_current_backoff_delay) is now
-        // done by report_connection_stage_success() once the full setup ladder
-        // completes and the first user-level response arrives. Resetting here
-        // would mask --max-reconnect-attempts under a READONLY-error storm
-        // where TCP-connect succeeds but READONLY repeatedly fails.
+        // The connect has only been started: "Reconnection successful" is
+        // logged once the setup ladder completes and the first response
+        // arrives (process_response), together with the reset of
+        // m_reconnect_attempts. Resetting here would mask
+        // --max-reconnect-attempts when TCP connects but a setup step fails
+        // every time (READONLY errors, AUTH after a password change).
+        benchmark_debug_log("Reconnection attempt %u: connecting.\n", m_reconnect_attempts);
     }
 }
 
