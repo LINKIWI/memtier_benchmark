@@ -43,14 +43,42 @@ $ sudo apt-get install build-essential autoconf automake \
 To build natively on macOS, use Homebrew to install the required dependencies:
 
 ```
-$ brew install autoconf automake libtool libevent pkg-config openssl@3.0 clang-format
+$ brew install autoconf automake libtool libevent pkg-config clang-format
 ```
 
-When running `./configure`, if it fails to find libssl it may be necessary to
-tweak the `PKG_CONFIG_PATH` environment variable:
+memtier must use the same OpenSSL that Homebrew's `libevent` is linked against.
+Mixing two OpenSSL versions in one process crashes on `--tls`. Which OpenSSL
+that is depends on the `libevent` revision you have, so ask Homebrew and point
+`PKG_CONFIG_PATH` at it when running `./configure`:
 
 ```
-PKG_CONFIG_PATH=`brew --prefix openssl@3.0`/lib/pkgconfig ./configure
+$ ssl=$(brew deps libevent | grep '^openssl@' | head -n 1)
+$ brew install $ssl
+$ PKG_CONFIG_PATH="$(brew --prefix $ssl)/lib/pkgconfig" ./configure
+```
+
+To use a different OpenSSL, install it (for example `brew install openssl@3`),
+build libevent from source against it, and put both prefixes in
+`PKG_CONFIG_PATH`. `scripts/build-macos-libevent.sh` does this and installs it
+under `$RUNNER_TEMP/libevent-memtier`:
+
+```
+$ brew install openssl@3
+$ RUNNER_TEMP=$HOME/build bash scripts/build-macos-libevent.sh "$(brew --prefix openssl@3)"
+$ PKG_CONFIG_PATH="$HOME/build/libevent-memtier/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig" ./configure
+```
+
+After `make`, check that `memtier_benchmark` and libevent's `libevent_openssl`
+link the same OpenSSL. For the Homebrew libevent build:
+
+```
+$ bash scripts/check-macos-tls-links.sh "$(brew --prefix $ssl)" "$(brew --prefix libevent)"
+```
+
+For the source-built libevent:
+
+```
+$ RUNNER_TEMP=$HOME/build bash scripts/check-macos-tls-links.sh "$(brew --prefix openssl@3)"
 ```
 
 ### Building and Installing
