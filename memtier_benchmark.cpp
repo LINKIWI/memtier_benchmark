@@ -887,6 +887,24 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->close_nesting();
 }
 
+// Parse a TCP/UDP port number: the whole string must be a decimal number in
+// [1,65535], starting with a digit (no sign or leading whitespace). The range
+// is checked on the unsigned long BEFORE narrowing. Shared by -p/--port,
+// --statsd-port, --graphite-port, the --uri port and --read-server HOST:PORT.
+static bool parse_port(const char *s, unsigned short *out)
+{
+    // Require a leading digit: strtoul() would otherwise skip any whitespace
+    // (including '\n', '\v', ...) and accept a sign, and wrap a negative value
+    // such as "\n-18446744073709551615" to a valid port.
+    if (s == NULL || !isdigit((unsigned char) *s)) return false;
+    char *endptr = NULL;
+    errno = 0;
+    unsigned long v = strtoul(s, &endptr, 10);
+    if (*endptr != '\0' || errno == ERANGE || v < 1 || v > 65535) return false;
+    *out = (unsigned short) v;
+    return true;
+}
+
 // Parse URI and populate config fields
 // Returns 0 on success, -1 on error
 static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string &uri_authenticate,
@@ -976,9 +994,8 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
     if (port_start) {
         *port_start = '\0';
         port_start++;
-        char *endptr;
-        unsigned long port = strtoul(port_start, &endptr, 10);
-        if (*endptr != '\0' || port == 0 || port > 65535) {
+        unsigned short port;
+        if (!parse_port(port_start, &port)) {
             fprintf(stderr, "error: invalid port number '%s'.\n", port_start);
             free(uri_copy);
             return -1;
@@ -986,7 +1003,7 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
         if (cfg->port) {
             fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
         }
-        cfg->port = (unsigned short) port;
+        cfg->port = port;
     }
 
     // Own URI hosts separately from a borrowed --server argument or the default.
@@ -1468,9 +1485,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->unix_socket = optarg;
             break;
         case 'p':
-            endptr = NULL;
-            cfg->port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (!cfg->port || cfg->port > 65535 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->port)) {
                 fprintf(stderr, "error: port must be a number in the range [1-65535].\n");
                 return -1;
             }
@@ -2206,9 +2221,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->statsd_host = optarg;
             break;
         case o_statsd_port:
-            endptr = NULL;
-            cfg->statsd_port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (cfg->statsd_port == 0 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->statsd_port)) {
                 fprintf(stderr, "error: statsd-port must be a valid port number.\n");
                 return -1;
             }
@@ -2220,9 +2233,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             cfg->statsd_run_label = optarg;
             break;
         case o_graphite_port:
-            endptr = NULL;
-            cfg->graphite_port = (unsigned short) strtoul(optarg, &endptr, 10);
-            if (cfg->graphite_port == 0 || !endptr || *endptr != '\0') {
+            if (!parse_port(optarg, &cfg->graphite_port)) {
                 fprintf(stderr, "error: graphite-port must be a valid port number.\n");
                 return -1;
             }
@@ -2429,9 +2440,8 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
                 fprintf(stderr, "error: --read-server: expected HOST:PORT, got '%s'.\n", optarg);
                 return -1;
             }
-            endptr = NULL;
-            unsigned long rport = strtoul(rscolon + 1, &endptr, 10);
-            if (!endptr || *endptr != '\0' || rport == 0 || rport > 65535) {
+            unsigned short rport;
+            if (!parse_port(rscolon + 1, &rport)) {
                 fprintf(stderr, "error: --read-server: invalid port in '%s'.\n", optarg);
                 return -1;
             }
@@ -2440,7 +2450,7 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (!rhost.empty() && rhost[0] == '[' && rhost[rhost.size() - 1] == ']') {
                 rhost = rhost.substr(1, rhost.size() - 2);
             }
-            cfg->read_servers.push_back(read_server_spec(rhost, (unsigned short) rport));
+            cfg->read_servers.push_back(read_server_spec(rhost, rport));
             break;
         }
         case o_command_is_read: {
