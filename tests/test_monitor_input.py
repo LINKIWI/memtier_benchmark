@@ -1,4 +1,5 @@
 import base64
+import csv
 import tempfile
 import os
 import json
@@ -1296,3 +1297,190 @@ def test_monitor_input_large_line_no_stack_overflow(env):
     env.assertTrue(found,
                    message="SET with 16 MiB value did not land in redis "
                            "- memtier may have crashed before sending it")
+
+
+def test_monitor_input_random_line_key_affixes_and_data(env):
+    """
+    Regression test for #655: a __monitor_line@__ line keeps the text around
+    __key__ (user:__key__, {tag}__key__:x) and fills __data__, the same way
+    the --command path (and __monitor_lineN__) does.
+
+    Before the fix the @ send loop wrote only the generated key, so the keys
+    landed as bare memtier-NNN.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_affixes.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "user:__key__" "v"\n')
+        f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "SET" "{tag}__key__:x" "__data__"\n')
+        # Like --command, only the first __key__ in an argument is replaced.
+        f.write('[ proxy ] 1764031576.604011 [0 127.0.0.1:5000] "SET" "a:__key__:b:__key__" "v"\n')
+        # Two key arguments in one command: each gets its own generated key,
+        # as with --command.
+        f.write('[ proxy ] 1764031576.604012 [0 127.0.0.1:5000] "MSET" "u:__key__" "__data__" "w:__key__" "v"\n')
+
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--monitor-pattern=S",
+            "--key-prefix=mon-",
+            # Sequential keys: the 40 requests draw 40 distinct keys from
+            # 1..100, so two key arguments never get the same key by chance.
+            "--command-key-pattern=S",
+            "--key-maximum=100",
+            "--data-size=20",
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=40)
+    master_nodes_list = env.getMasterNodesList()
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    for conn in master_nodes_connections:
+        conn.execute_command("FLUSHALL")
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=60)
+
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    keys = []
+    for conn in master_nodes_connections:
+        keys.extend(k.decode() for k in conn.execute_command("KEYS", "*"))
+    user_keys = [k for k in keys if k.startswith("user:mon-")]
+    tag_keys = [k for k in keys if k.startswith("{tag}mon-") and k.endswith(":x")]
+    rep_keys = [k for k in keys if k.startswith("a:mon-") and k.endswith(":b:__key__")]
+    u_keys = [k for k in keys if k.startswith("u:mon-")]
+    w_keys = [k for k in keys if k.startswith("w:mon-")]
+    env.assertTrue(len(user_keys) > 0, message="no user:mon-* keys; keys: {}".format(keys[:10]))
+    env.assertTrue(len(tag_keys) > 0, message="no {{tag}}mon-*:x keys; keys: {}".format(keys[:10]))
+    env.assertTrue(len(rep_keys) > 0, message="no a:mon-*:b:__key__ keys; keys: {}".format(keys[:10]))
+    env.assertTrue(len(u_keys) > 0, message="no u:mon-* keys from MSET; keys: {}".format(keys[:10]))
+    env.assertTrue(len(w_keys) > 0, message="no w:mon-* keys from MSET; keys: {}".format(keys[:10]))
+    # Each MSET drew a separate key for u: and w:, so with sequential keys the
+    # two sets of key numbers never overlap.
+    u_ids = set(k[len("u:mon-"):] for k in u_keys)
+    w_ids = set(k[len("w:mon-"):] for k in w_keys)
+    env.assertEqual(u_ids & w_ids, set(), message="MSET reused one key for both key arguments")
+    known = set(user_keys + tag_keys + rep_keys + u_keys + w_keys)
+    env.assertEqual(len(keys), len(known),
+                    message="keys without their affixes: {}".format([k for k in keys if k not in known][:10]))
+    conn = master_nodes_connections[0]
+    if user_keys:
+        env.assertEqual(conn.execute_command("GET", user_keys[0]), b"v")
+    if tag_keys:
+        # __data__ is replaced by a generated --data-size value.
+        env.assertEqual(len(conn.execute_command("GET", tag_keys[0])), 20)
+
+
+def test_monitor_input_random_line_placeholder_in_key_prefix(env):
+    """
+    A generated key or value that itself contains placeholder text must be
+    sent as-is. With --key-prefix=__key__ (or __data__), the key filled into a
+    __monitor_line@__ line is "__key__NNN"; it must not be parsed again as a
+    key/data argument (that dropped the argument and hung the run, or
+    rejected the line). __monitor_line1__ already handles this.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_prefix_placeholder.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "SET" "__key__" "v"\n')
+
+    master_nodes_connections = env.getOSSMasterNodesConnectionList()
+    conn = master_nodes_connections[0]
+    for prefix in ("__key__", "__data__"):
+        conn.execute_command("FLUSHALL")
+        benchmark_specs = {
+            "name": env.testName,
+            "args": [
+                "--monitor-input={}".format(monitor_file),
+                "--command=__monitor_line@__",
+                "--key-prefix={}".format(prefix),
+                "--key-maximum=100",
+                "--hide-histogram",
+            ],
+        }
+        addTLSArgs(benchmark_specs, env)
+
+        config = get_default_memtier_config(threads=1, clients=1, requests=20)
+        add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+        config = RunConfig(tempfile.mkdtemp(), env.testName, config, {})
+        ensure_clean_benchmark_folder(config.results_dir)
+
+        benchmark = Benchmark.from_json(config, benchmark_specs)
+        memtier_ok = benchmark.run(timeout=30)
+
+        debugPrintMemtierOnError(config, env)
+        env.assertTrue(memtier_ok == True, message="run failed with --key-prefix={}".format(prefix))
+        keys = [k.decode() for k in conn.execute_command("KEYS", "*")]
+        env.assertTrue(len(keys) > 0, message="no keys written with --key-prefix={}".format(prefix))
+        env.assertTrue(all(k.startswith(prefix) and k[len(prefix):].isdigit() for k in keys),
+                       message="unexpected keys with --key-prefix={}: {}".format(prefix, keys[:10]))
+
+
+def test_monitor_input_random_line_failed_keys_file(env):
+    """
+    --failed-keys-file records the key a __monitor_line@__ request was sent
+    with (affixes included), as it does for --command. A line whose every
+    request fails (INCRBY by a non-integer) must log user:mon-NNN keys, not
+    an empty key. The logged key is argument 1, the one cluster mode routes
+    by, even when __key__ is only in a later argument: "INCRBY" "fixed"
+    "x:__key__" logs "fixed", not the generated x:mon-NNN.
+    """
+    env.skipOnCluster()
+
+    test_dir = tempfile.mkdtemp()
+    monitor_file = os.path.join(test_dir, "monitor_failed_keys.txt")
+    with open(monitor_file, "w") as f:
+        f.write('[ proxy ] 1764031576.604009 [0 127.0.0.1:5000] "INCRBY" "user:__key__" "x"\n')
+        f.write('[ proxy ] 1764031576.604010 [0 127.0.0.1:5000] "INCRBY" "fixed" "x:__key__"\n')
+    failed_log = os.path.join(test_dir, "failed_keys.csv")
+
+    requests = 20
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--monitor-input={}".format(monitor_file),
+            "--command=__monitor_line@__",
+            "--key-prefix=mon-",
+            "--key-maximum=100",
+            "--failed-keys-file={}".format(failed_log),
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run(timeout=60)
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok == True)
+
+    with open(failed_log) as fh:
+        rows = [r for r in csv.reader(fh) if r and not r[0].startswith("#") and r[0] != "timestamp"]
+    env.assertEqual(len(rows), requests, message="failed-keys rows: {}".format(rows[:5]))
+    keys = [r[2] for r in rows]
+    bad = [k for k in keys if not k.startswith("user:mon-") and k != "fixed"]
+    env.assertEqual(bad, [], message="logged keys other than user:mon-* / fixed: {}".format(bad[:5]))
+    # The default --monitor-pattern=S alternates the two lines.
+    env.assertTrue("fixed" in keys, message="no row for the fixed-key line: {}".format(keys[:10]))
+    env.assertTrue(any(k.startswith("user:mon-") for k in keys), message="no user:mon-* rows: {}".format(keys[:10]))

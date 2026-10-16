@@ -983,7 +983,10 @@ bool redis_protocol::format_arbitrary_command(arbitrary_command &cmd)
         current_arg->type = const_type;
 
         // check arg type
-        if (current_arg->data.find(KEY_PLACEHOLDER) != std::string::npos) {
+        if (current_arg->resolved) {
+            // Already filled in by client::resolve_monitor_placeholders():
+            // frame the generated key as-is, without scanning it again.
+        } else if (current_arg->data.find(KEY_PLACEHOLDER) != std::string::npos) {
             if (current_arg->data.length() != strlen(KEY_PLACEHOLDER)) {
                 current_arg->has_key_affixes = true;
                 current_arg->data_prefix = current_arg->data.substr(0, current_arg->data.find(KEY_PLACEHOLDER));
