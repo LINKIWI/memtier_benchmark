@@ -294,6 +294,11 @@ void report_connection_stage_success(void)
     }
 }
 
+bool connection_stage_steady_state_reached(void)
+{
+    return g_conn_stage_steady_state.load(std::memory_order_acquire);
+}
+
 bool connection_stage_should_abort(unsigned int timeout_secs, std::string *out_last_err, unsigned int *out_elapsed)
 {
     if (timeout_secs == 0) return false; // operator opt-out
@@ -2781,7 +2786,8 @@ void usage()
         "                                 CLUSTER SLOTS / -ERR during initial probe) persist for SECS\n"
         "                                 without a successful handshake. Bounds the *startup* phase;\n"
         "                                 --test-time still bounds the steady-state run. Default: 30,\n"
-        "                                 0 disables the supervisor.\n"
+        "                                 0 disables the supervisor (at startup, a failed CLUSTER SLOTS\n"
+        "                                 is then retried every second).\n"
         "      --thread-conn-start-min-jitter-micros=NUM Minimum jitter in microseconds between connection creation "
         "(default: 0)\n"
         "      --thread-conn-start-max-jitter-micros=NUM Maximum jitter in microseconds between connection creation "
