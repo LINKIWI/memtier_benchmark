@@ -167,7 +167,9 @@ protected:
             return *this;
         }
     } m_started;
-    bool m_interrupted;
+    // Set by client_group::interrupt() on the main thread, possibly while the
+    // worker reads it (client_group::run()).
+    copyable_atomic_bool m_interrupted;
     // Workload requests abandoned because no reply came within
     // TEST_TIME_DRAIN_GRACE_SECS after --test-time ended.
     unsigned long long int m_unanswered_requests;
@@ -227,10 +229,10 @@ public:
     run_stats(benchmark_config *config);
     void setup_arbitrary_commands(size_t n_arbitrary_commands);
     void set_start_time(struct timeval *start_time);
-    void set_end_time(struct timeval *end_time, bool keep_live_totals = false);
+    void set_end_time(struct timeval *end_time);
     struct timeval get_start_time(void) const { return m_start_time; }
-    void set_interrupted(bool interrupted) { m_interrupted = interrupted; }
-    bool get_interrupted() const { return m_interrupted; }
+    void set_interrupted(bool interrupted) { m_interrupted.flag.store(interrupted, std::memory_order_relaxed); }
+    bool get_interrupted() const { return m_interrupted.flag.load(std::memory_order_relaxed); }
     void add_unanswered_requests(unsigned long long int n) { m_unanswered_requests += n; }
     unsigned long long int get_unanswered_requests() const { return m_unanswered_requests; }
 
@@ -341,7 +343,7 @@ public:
 
     void aggregate_average(const std::vector<run_stats> &all_stats);
     void summarize(totals &result) const;
-    void summarize_current_second(bool keep_live_totals = false);
+    void summarize_current_second(void);
     void merge(const run_stats &other, int iteration);
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_get();
     std::vector<one_sec_cmd_stats> get_one_sec_cmd_stats_set();
@@ -360,9 +362,8 @@ public:
     // call into target (Prometheus exporter, main thread). Lags the live
     // second by up to one second; the final partial second is folded by
     // set_end_time(). With run_end (post-join only) it also moves what is
-    // left in the live histogram: ops a worker completed after an
-    // interrupt()-driven set_end_time(). After the run-end drain every op has
-    // been drained.
+    // left in the live histogram (ops recorded after the client's
+    // set_end_time()). After the run-end drain every op has been drained.
     void drain_prom_latency_histogram(hdr_histogram *target, bool run_end);
     void save_csv_one_sec_cluster(FILE *f);
     void save_csv_set_get_commands(FILE *f, bool cluster_mode);

@@ -27,6 +27,7 @@
 #include <vector>
 #include <queue>
 #include <atomic>
+#include <pthread.h>
 #include <iterator>
 #include <event2/event.h>
 #include <event2/buffer.h>
@@ -219,8 +220,9 @@ public:
     virtual bool all_connections_idle(void);
     virtual void set_start_time();
     virtual void set_end_time();
-    // set_end_time() for client_group::interrupt(), on the main thread.
-    void set_end_time_keep_live_totals(bool keep_live_totals);
+    // set_end_time() at the time client_group::interrupt() was called, after
+    // the worker thread was joined.
+    void set_end_time_interrupted(struct timeval *end_time);
     virtual void create_request(struct timeval timestamp, unsigned int conn_id);
     virtual bool hold_pipeline(unsigned int conn_id);
     virtual int connect(void);
@@ -333,6 +335,18 @@ protected:
     struct event *m_staircase_timer;
     std::atomic<unsigned int> m_staircase_active_clients;
     unsigned int m_staircase_steps;
+    // Set by interrupt(), read after the worker thread was joined; both on
+    // the main thread.
+    bool m_interrupt_requested;
+    struct timeval m_interrupt_time;
+    // Only the worker thread that runs the loop may stamp the clients'
+    // run_stats until it has been joined (#710); check_stats_owner() checks it.
+    // m_worker_tid is written once by the worker before it publishes
+    // m_worker_tid_set (release); readers load the flag (acquire) first.
+    std::atomic<bool> m_worker_tid_set;
+    pthread_t m_worker_tid;
+    std::atomic<bool> m_joined;
+    void check_stats_owner(const char *what);
     void setup_staircase_timer(void);
     void handle_staircase_step(void);
     static void staircase_timer_cb(evutil_socket_t fd, short what, void *arg);
@@ -349,7 +363,10 @@ public:
     int prepare_count(unsigned int count);
     void run(void);
     void interrupt(void);
-    void finalize_all_clients(bool keep_live_totals = false);
+    void finalize_all_clients(struct timeval *end_time = NULL);
+    void finalize_interrupted_clients(void);
+    // Called after pthread_join() of the worker thread that ran run().
+    void mark_joined(void) { m_joined.store(true, std::memory_order_release); }
     void set_all_clients_interrupted(void);
     unsigned int count_unended_clients(void);
     void end_stalled_clients(void);

@@ -171,7 +171,7 @@ void run_stats::set_start_time(struct timeval *start_time)
     m_started.flag.store(true, std::memory_order_release);
 }
 
-void run_stats::set_end_time(struct timeval *end_time, bool keep_live_totals)
+void run_stats::set_end_time(struct timeval *end_time)
 {
     struct timeval tv;
     if (!end_time) {
@@ -179,16 +179,11 @@ void run_stats::set_end_time(struct timeval *end_time, bool keep_live_totals)
         end_time = &tv;
     }
     m_end_time = *end_time;
-    // keep_live_totals is set only by interrupt() (Ctrl+C, connection-stage
-    // abort), which runs this on the main thread while the worker may still
-    // record ops lock-free; folding and resetting the live totals here would
-    // drop the samples recorded between the add and the reset. Leave them for
-    // the exporter's post-join drain.
-    summarize_current_second(keep_live_totals && m_config->prometheus != NULL);
+    summarize_current_second();
     m_stats.push_back(m_cur_stats);
 }
 
-void run_stats::summarize_current_second(bool keep_live_totals)
+void run_stats::summarize_current_second(void)
 {
     m_cur_stats.m_get_cmd.summarize_quantiles(inst_m_get_latency_histogram, quantiles_list, m_quantile_values);
     m_cur_stats.m_set_cmd.summarize_quantiles(inst_m_set_latency_histogram, quantiles_list, m_quantile_values);
@@ -202,7 +197,6 @@ void run_stats::summarize_current_second(bool keep_live_totals)
     hdr_reset(inst_m_get_latency_histogram);
     hdr_reset(inst_m_set_latency_histogram);
     hdr_reset(inst_m_wait_latency_histogram);
-    if (keep_live_totals) return;
     pthread_mutex_lock(&m_inst_histogram_mutex.mtx);
     if (m_config->prometheus != NULL) hdr_add(m_prom_pending_latency_histogram, inst_m_totals_latency_histogram);
     hdr_reset(inst_m_totals_latency_histogram);
@@ -222,10 +216,8 @@ void run_stats::drain_prom_latency_histogram(hdr_histogram *target, bool run_end
     hdr_add(target, m_prom_pending_latency_histogram);
     hdr_reset(m_prom_pending_latency_histogram);
     if (run_end) {
-        // Post-join only. After interrupt() (Ctrl+C, connection-stage abort)
-        // set_end_time() leaves the live totals in place, and a worker may
-        // still have finished a read callback after it; those ops are only
-        // here. Empty on the --test-time / --requests paths.
+        // Post-join only: whatever is still in the live histogram, ops
+        // recorded after the client's set_end_time(). Normally empty.
         hdr_add(target, inst_m_totals_latency_histogram);
         hdr_reset(inst_m_totals_latency_histogram);
     }
@@ -1112,7 +1104,7 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
         total_duration_usec += ts_diff(i->m_start_time, i->m_end_time);
 
         // Like merge(): the average is interrupted if any of its runs was.
-        if (i->m_interrupted) m_interrupted = true;
+        if (i->get_interrupted()) set_interrupted(true);
     }
 
     m_totals.m_set_cmd.aggregate_average(all_stats.size());
@@ -1197,7 +1189,7 @@ void run_stats::merge(const run_stats &other, int iteration)
     // none unanswered.
     if (!other.has_started()) {
         m_cur_stats.m_connection_errors += other.m_totals.m_connection_errors;
-        if (other.m_interrupted) m_interrupted = true;
+        if (other.get_interrupted()) set_interrupted(true);
         return;
     }
 
@@ -1209,8 +1201,8 @@ void run_stats::merge(const run_stats &other, int iteration)
     if (other.has_started()) m_started.flag.store(true, std::memory_order_release);
 
     // If any run was interrupted, mark the merged result as interrupted
-    if (other.m_interrupted) {
-        m_interrupted = true;
+    if (other.get_interrupted()) {
+        set_interrupted(true);
     }
     m_unanswered_requests += other.m_unanswered_requests;
 
@@ -2038,7 +2030,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
         jsonhandler->write_obj("Finish time", "%lld", end_time_ms);
         jsonhandler->write_obj("Total duration", "%lld", end_time_ms - start_time_ms);
         jsonhandler->write_obj("Time unit", "\"%s\"", "MILLISECONDS");
-        jsonhandler->write_obj("Interrupted", "\"%s\"", m_interrupted ? "true" : "false");
+        jsonhandler->write_obj("Interrupted", "\"%s\"", get_interrupted() ? "true" : "false");
         jsonhandler->write_obj("Unanswered requests", "%llu", m_unanswered_requests);
         jsonhandler->close_nesting();
     }
