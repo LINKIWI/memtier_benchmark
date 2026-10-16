@@ -28,11 +28,12 @@ INVALID_VALUES = (
     # Negatives that strtoul() wraps back into 1..65535, with and without
     # leading whitespace strtoul() skips.
     "-18446744073709551615", "-18446744073709545916", "\n-18446744073709551615",
-    "\v-18446744073709551615", "+6379", " 6379", "\t6379",
+    "\v-18446744073709551615", "- 6379", "+-6379", "++6379",
     "0", "", " ", "abc", "1x", "6379 ", "0x50",
 )
 
-VALID_VALUES = ("1", "6379", "65535")
+# Leading whitespace and one '+' were accepted by strtoul() and still are.
+VALID_VALUES = ("1", "6379", "65535", "+6379", " 6379", "\t6379")
 
 
 def _run(args):
@@ -76,16 +77,16 @@ def test_port_options_accept_valid_values(env):
 def test_port_ignores_errno_from_earlier_options(env):
     """An earlier option's strtoul overflow must not reject a valid port.
 
-    --max-reconnect-attempts does not check ERANGE today, so it is used here to
-    leave errno set; if it starts rejecting overflow, pick another such option.
+    --key-maximum does not check ERANGE yet (#725), so it is used here to
+    leave errno set; once #725 lands, pick another errno source.
     """
-    result = _run(["--max-reconnect-attempts=99999999999999999999999", "--port=6379", "--statsd-port=8125",
+    result = _run(["--key-maximum=99999999999999999999999", "--port=6379", "--statsd-port=8125",
                    "--graphite-port=2003"])
     env.assertEqual(result.returncode, 0, message=result.stderr)
 
 
 def test_read_server_port_rejects_out_of_range_and_malformed(env):
-    for value in ("65537", "0", "-1", "-18446744073709551615", "+6379", "6379x"):
+    for value in ("65537", "0", "-1", "-18446744073709551615", "++6379", "6379x"):
         result = _run(["--read-server=127.0.0.1:" + value])
         label = "--read-server port {!r}".format(value)
         env.assertEqual(result.returncode, 2, message=label + ": " + result.stderr)
@@ -99,7 +100,7 @@ def test_uri_port_rejects_out_of_range_and_malformed(env):
     # The URI is parsed after --version would exit, so this runs a real
     # command line; it needs no server because parsing fails before any
     # connection attempt.
-    for value in ("65537", "0", "-18446744073709551615", "+80"):
+    for value in ("65537", "0", "-18446744073709551615", "-80"):
         result = subprocess.run(
             [MEMTIER_BINARY, "--uri=redis://127.0.0.1:" + value, "-n", "1", "-c", "1", "-t", "1"],
             capture_output=True,
