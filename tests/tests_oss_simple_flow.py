@@ -6,6 +6,9 @@ import signal
 import subprocess
 import shutil
 import os
+import fcntl
+import socket
+import struct
 from include import *
 from mb import Benchmark, RunConfig
 
@@ -1871,3 +1874,295 @@ def test_startup_error_keeps_output_files_data_import(env):
     expected = ("error: Cluster mode cannot be specified when importing." if env.isCluster()
                 else "error: failed to read keys.")
     _startup_error_keeps_output_files(env, ['--data-import', '/nonexistent-memtier-dir/keys.imp'], 1, expected)
+
+
+def _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file=False, prefix=None, requests=10,
+                   test_time=None):
+    """Start a short benchmark whose output goes to extra_args/stdout; return the Popen.
+
+    The results and memtier's stderr (work_dir/memtier.stderr) go under
+    work_dir. prefix (e.g. ['stdbuf', '-o0']) is put in front of the memtier
+    command.
+    """
+    benchmark_specs = {"name": env.testName, "args": ['--hide-histogram'] + extra_args}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=requests, test_time=test_time)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    config = RunConfig(work_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    args = list(benchmark.args)
+    if drop_default_out_file:
+        # mb.py always passes --out-file; without it the results go to stdout.
+        i = args.index('--out-file')
+        del args[i:i + 2]
+    proc_env = None
+    if prefix:
+        args = prefix + args
+        # stdbuf works by LD_PRELOAD; let an ASan build accept that.
+        proc_env = dict(os.environ)
+        proc_env['ASAN_OPTIONS'] = (proc_env.get('ASAN_OPTIONS', '') + ':verify_asan_link_order=0').lstrip(':')
+    with open(_memtier_stderr_path(work_dir), 'wb') as stderr:
+        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=proc_env)
+
+
+def _memtier_stderr_path(work_dir):
+    return os.path.join(work_dir, 'memtier.stderr')
+
+
+def _read_memtier_stderr(work_dir):
+    with open(_memtier_stderr_path(work_dir), 'rb') as f:
+        return f.read().decode(errors='replace')
+
+
+def _finish_memtier(process, work_dir, timeout=30):
+    """Wait for a _start_memtier() process; return (rc, stderr)."""
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    return process.returncode, _read_memtier_stderr(work_dir)
+
+
+def _run_with_unwritable_output(env, extra_args, stdout, drop_default_out_file=False, prefix=None, **kwargs):
+    """Run a short benchmark whose output goes to extra_args/stdout; return (rc, stderr)."""
+    with tempfile.TemporaryDirectory() as work_dir:
+        process = _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file, prefix, **kwargs)
+        return _finish_memtier(process, work_dir)
+
+
+def _closed_pipe_run(env, extra_args, prefix=None):
+    """Run with stdout on a pipe whose read end is already closed; return (rc, stderr)."""
+    rfd, wfd = os.pipe()
+    os.close(rfd)
+    try:
+        return _run_with_unwritable_output(env, extra_args, wfd, drop_default_out_file=True, prefix=prefix)
+    finally:
+        os.close(wfd)
+
+
+def test_out_file_write_error(env):
+    """A --out-file that cannot be written fails the run (#719).
+
+    /dev/full accepts the open and fails every write with ENOSPC, like a full
+    disk. memtier used to ignore the failed writes and fclose() and exit 0.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    rc, stderr = _run_with_unwritable_output(env, ['--out-file', '/dev/full'], subprocess.DEVNULL)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing --out-file /dev/full: No space left on device", stderr)
+
+
+def test_json_out_file_write_error(env):
+    """A --json-out-file that cannot be written fails the run (#719)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    rc, stderr = _run_with_unwritable_output(env, ['--json-out-file', '/dev/full'], subprocess.DEVNULL)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing --json-out-file /dev/full: No space left on device", stderr)
+    env.assertNotContains("Json file closed.", stderr)
+
+
+def test_stdout_write_error(env):
+    """Results on stdout that cannot be written fail the run (#719)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    with open('/dev/full', 'w') as full:
+        rc, stderr = _run_with_unwritable_output(env, [], full, drop_default_out_file=True)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing results to stdout: No space left on device", stderr)
+
+
+def test_connection_stage_abort_keeps_rc_2_on_write_error(env):
+    """A connection-stage abort exits 2 even when the output write fails (#719).
+
+    The output error is still reported. A wrong password makes every
+    connection fail AUTH, so --connection-stage-timeout=1 aborts the run.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    rc, stderr = _run_with_unwritable_output(
+        env, ['--authenticate', 'memtier-719-wrong-password', '--connection-stage-timeout=1',
+              '--out-file', '/dev/full'],
+        subprocess.DEVNULL, requests=None, test_time=20)
+    env.assertEqual(rc, 2, message=stderr)
+    env.assertContains("aborting after", stderr)
+    env.assertContains("error: failed writing --out-file /dev/full: No space left on device", stderr)
+
+
+def test_out_file_fifo_reader_exits_is_an_error(env):
+    """An --out-file FIFO whose reader exits fails the run (#719).
+
+    Only stdout, or an --out-file that is the same file as stdout, gets the
+    gone-reader exemption; for any other --out-file the results are lost.
+    """
+    with tempfile.TemporaryDirectory() as work_dir:
+        fifo = os.path.join(work_dir, 'results.fifo')
+        os.mkfifo(fifo)
+        # Open the read end first (non-blocking), so memtier's open() does not block.
+        rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            process = _start_memtier(env, work_dir, ['--out-file', fifo], subprocess.DEVNULL, requests=None,
+                                     test_time=2)
+            # Close the reader only once memtier has the FIFO open (it prints
+            # this line after the open). Closed earlier, memtier's open() would
+            # wait for a new reader forever.
+            opened = "Writing results to {}...".format(fifo)
+            deadline = time.time() + 30
+            while (opened not in _read_memtier_stderr(work_dir) and process.poll() is None
+                   and time.time() < deadline):
+                time.sleep(0.05)
+        finally:
+            os.close(rfd)
+        rc, stderr = _finish_memtier(process, work_dir)
+    env.assertContains(opened, stderr)
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing --out-file {}: Broken pipe".format(fifo), stderr)
+
+
+def test_stdout_closed_pipe_is_not_an_error(env):
+    """A stdout reader that went away (e.g. `| head`) is not a failed run (#719).
+
+    SIGPIPE is ignored, so the writes fail with EPIPE; that is the reader's
+    choice, not a lost result, and the exit status stays 0.
+    """
+    rc, stderr = _closed_pipe_run(env, [])
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("error: failed writing", stderr)
+
+
+def test_stdout_closed_pipe_unbuffered_is_not_an_error(env):
+    """A gone stdout reader is not an error with any stdout buffering (#719).
+
+    stdio may drop the data of a failed write (glibc does line-buffered and
+    unbuffered, musl always), so the final fflush() succeeds with only ferror()
+    set and the EPIPE is lost. The exemption must not depend on that errno.
+    """
+    if shutil.which('stdbuf') is None:
+        env.skip()
+        return
+    for mode in ['-o0', '-oL']:
+        rc, stderr = _closed_pipe_run(env, [], prefix=['stdbuf', mode])
+        env.assertEqual(rc, 0, message='stdbuf {}: {}'.format(mode, stderr))
+        env.assertNotContains("error: failed writing", stderr)
+
+
+def test_stdout_reader_exits_early(env):
+    """`memtier | head -n 1` exits 0, the reader quitting mid-output (#719).
+
+    A best-effort smoke test: whether head has exited before memtier writes
+    depends on timing (it caught the lost-EPIPE bug in 27 of 30 runs). The
+    closed-pipe tests above are the deterministic guard.
+    """
+    if shutil.which('stdbuf') is None or shutil.which('head') is None:
+        env.skip()
+        return
+    head = subprocess.Popen(['head', '-n', '1'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+    try:
+        rc, stderr = _run_with_unwritable_output(env, [], head.stdin, drop_default_out_file=True,
+                                                 prefix=['stdbuf', '-oL'])
+    finally:
+        head.stdin.close()
+        head.wait(timeout=10)
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("error: failed writing", stderr)
+
+
+def test_out_file_dev_stdout_closed_pipe_is_not_an_error(env):
+    """--out-file /dev/stdout gets the stdout rule for a gone reader (#719)."""
+    if not os.path.exists('/dev/stdout'):
+        env.skip()
+        return
+    rc, stderr = _closed_pipe_run(env, ['--out-file', '/dev/stdout'])
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("error: failed writing", stderr)
+
+
+def test_stdout_closed_socket_is_not_an_error(env):
+    """A stdout socket whose peer went away is not a failed run (#719).
+
+    Covers a closed unix socketpair peer (EPIPE) and a TCP peer that reset
+    the connection (ECONNRESET), with default buffering and, where stdbuf
+    exists, unbuffered (the errno is then lost and poll() decides).
+    """
+    prefixes = [None]
+    if shutil.which('stdbuf') is not None:
+        prefixes.append(['stdbuf', '-o0'])
+
+    def closed_socketpair():
+        a, b = socket.socketpair()
+        b.close()
+        return a
+
+    def reset_tcp():
+        # Bound to an ephemeral port; nothing else connects to it.
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        client = socket.create_connection(listener.getsockname(), timeout=5)
+        peer, _ = listener.accept()
+        listener.close()
+        # SO_LINGER 0: close() sends RST instead of FIN.
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        peer.close()
+        time.sleep(0.1)
+        return client
+
+    for name, make in [('socketpair', closed_socketpair), ('tcp-rst', reset_tcp)]:
+        for prefix in prefixes:
+            sock = make()
+            try:
+                rc, stderr = _run_with_unwritable_output(env, [], sock.fileno(), drop_default_out_file=True,
+                                                         prefix=prefix)
+            finally:
+                sock.close()
+            label = '{} {}: {}'.format(name, prefix, stderr)
+            env.assertEqual(rc, 0, message=label)
+            env.assertNotContains("error: failed writing", stderr)
+
+
+def _full_nonblocking_pipe():
+    """Return (rfd, wfd): a pipe filled to the last byte, its write end O_NONBLOCK."""
+    rfd, wfd = os.pipe()
+    try:
+        fcntl.fcntl(wfd, getattr(fcntl, "F_SETPIPE_SZ", 1031), 4096)
+    except OSError:
+        pass  # a larger pipe is just filled with more data
+    os.set_blocking(wfd, False)
+    # Fill it to the last byte: a write <= PIPE_BUF is all-or-nothing.
+    for chunk in (b'x' * 4096, b'x'):
+        try:
+            while True:
+                os.write(wfd, chunk)
+        except BlockingIOError:
+            pass
+    return rfd, wfd
+
+
+def test_stdout_full_nonblocking_pipe_is_an_error(env):
+    """Results lost on a live stdout pipe fail the run (#719).
+
+    stdout is a full non-blocking pipe whose reader is still open (as when it
+    is shared with a parent that set O_NONBLOCK), so the writes fail with
+    EAGAIN. With default buffering the EAGAIN is reported; line-buffered,
+    glibc drops that data and only a synthetic EIO is left. Either way the
+    reader is still there, so this must not pass as a gone reader.
+    """
+    prefixes = [None]
+    if shutil.which('stdbuf') is not None:
+        prefixes.append(['stdbuf', '-oL'])
+    for prefix in prefixes:
+        rfd, wfd = _full_nonblocking_pipe()
+        try:
+            rc, stderr = _run_with_unwritable_output(env, [], wfd, drop_default_out_file=True, prefix=prefix)
+        finally:
+            os.close(wfd)
+            os.close(rfd)
+        env.assertEqual(rc, 1, message='{}: {}'.format(prefix, stderr))
+        env.assertContains("error: failed writing results to stdout: ", stderr)

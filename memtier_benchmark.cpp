@@ -49,6 +49,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <poll.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -101,6 +102,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 #include "client.h"
 #include "cluster_client.h"
 #include "JSON_handler.h"
+#include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
 #include "run_stats_types.h"
@@ -4433,6 +4435,29 @@ static void cleanup_openssl(void)
 
 #endif
 
+// True if the write error err on the still-open fp only means that the stdout
+// reader went away (e.g. `| head`): fp is stdout or the same file, a pipe or
+// socket, and the error is EPIPE/ECONNRESET (SIGPIPE is ignored). The EIO from
+// finish_output_file() hides the real errno, which may be EAGAIN on a full
+// stdout pipe made non-blocking by a parent sharing it (e.g. Node or a CI
+// runner), so for EIO poll(): POLLERR/POLLHUP means the reader is gone.
+static bool stdout_reader_gone(FILE *fp, int err)
+{
+    if (err != EPIPE && err != ECONNRESET && err != EIO) return false;
+    int fd = fileno(fp);
+    struct stat st, out_st;
+    if (fstat(fd, &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
+    if (fp != stdout &&
+        (fstat(STDOUT_FILENO, &out_st) != 0 || st.st_dev != out_st.st_dev || st.st_ino != out_st.st_ino))
+        return false;
+    if (err != EIO) return true;
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    return poll(&pfd, 1, 0) == 1 && (pfd.revents & (POLLERR | POLLHUP)) != 0;
+}
+
 int main(int argc, char *argv[])
 {
     // Enable libevent's pthreads bindings so event_base_loopbreak() /
@@ -5232,14 +5257,9 @@ int main(int argc, char *argv[])
         obj_gen->set_key_zipf_distribution(cfg.key_zipf_exp);
     }
 
-    // Prepare output files. This comes after all option validation and the
-    // data-import loading, so a startup error leaves an existing --out-file
-    // and --json-out-file untouched. Nothing has connected yet.
-    // --out-file is opened without O_TRUNC and only truncated once the
-    // --json-out-file has been opened too, so an error opening either one
-    // leaves the other untouched. Fail now rather than run the whole
-    // benchmark and then write the results to a NULL FILE*. Retry on EINTR,
-    // as json_handler does.
+    // Open the output files after option validation and data import, so a
+    // startup error leaves existing files untouched. Retry on EINTR, as
+    // json_handler does.
     FILE *outfile = stdout;
     if (cfg.out_file != NULL) {
         int fd;
@@ -5256,13 +5276,16 @@ int main(int argc, char *argv[])
     json_handler *jsonhandler = NULL;
     if (cfg.json_out_file != NULL) {
         jsonhandler = new json_handler((const char *) cfg.json_out_file);
-        // We allways print the configuration to the JSON file
+        // We always print the configuration to the JSON file
         config_print_to_json(jsonhandler, &cfg);
     }
 
     if (cfg.out_file != NULL) {
         fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
-        // Only regular files can be truncated (not e.g. /dev/stdout or a FIFO).
+        // --out-file was opened without O_TRUNC and is truncated only now that
+        // --json-out-file is open too, so an error opening either one leaves the
+        // other untouched. Only regular files can be truncated (not e.g.
+        // /dev/stdout or a FIFO).
         struct stat st;
         if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
             fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
@@ -5470,8 +5493,23 @@ int main(int argc, char *argv[])
         event_base_free(verify_event_base);
     }
 
-    if (outfile != stdout) {
-        fclose(outfile);
+    // A results file that could not be written (disk full, quota, I/O error)
+    // fails the run, with one exception: stdout (or an --out-file that is
+    // stdout, e.g. /dev/stdout) on a pipe or socket whose reader went away,
+    // e.g. `| head`. That is the reader's choice, not a lost result.
+    // Keep this check after the last write to outfile.
+    bool output_failed = false;
+    int out_err = finish_output_file(outfile, false);
+    // Checked before fclose(), while the fd is still open.
+    bool reader_gone = out_err != 0 && stdout_reader_gone(outfile, out_err);
+    if (outfile != stdout && fclose(outfile) != 0 && out_err == 0) out_err = errno;
+    if (out_err != 0 && !reader_gone) {
+        if (outfile == stdout) {
+            fprintf(stderr, "error: failed writing results to stdout: %s\n", strerror(out_err));
+        } else {
+            fprintf(stderr, "error: failed writing --out-file %s: %s\n", cfg.out_file, strerror(out_err));
+        }
+        output_failed = true;
     }
 
     if (cfg.server_addr) {
@@ -5484,6 +5522,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Saving JSON output file: %s\n", cfg.json_out_file);
 
         // closing the JSON
+        int json_err = jsonhandler->close();
+        if (json_err != 0) {
+            fprintf(stderr, "error: failed writing --json-out-file %s: %s\n", cfg.json_out_file, strerror(json_err));
+            output_failed = true;
+        }
         delete jsonhandler;
     }
 
@@ -5545,6 +5588,10 @@ int main(int argc, char *argv[])
     // A worker thread ended before the run's stop condition (see
     // run_benchmark()); the results above do not cover the requested run.
     if (g_worker_failed) {
+        return 1;
+    }
+    // The results could not be written (see above).
+    if (output_failed) {
         return 1;
     }
     return 0;

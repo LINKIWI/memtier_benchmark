@@ -268,10 +268,32 @@ Exit status:
 
 - after a graceful interrupt (first SIGINT or SIGTERM): **0**. Check
   `"Interrupted": "true"` in the JSON to tell an interrupted run from a
-  complete one.
+  complete one. If the results cannot be written, the exit status is 1
+  instead (see below).
 - after a second signal: memtier dies by that signal (128 + signal number in
   a shell: 130 for SIGINT, 143 for SIGTERM), and the JSON file is
   incomplete.
+
+### Output write errors
+
+If the results cannot be written to `--out-file`, `--json-out-file` or
+stdout (for example on a full disk, an exceeded quota, an I/O error, or a
+closed stdout), memtier prints `error: failed writing --out-file PATH:
+REASON` (or `--json-out-file PATH`, or `results to stdout`) and exits with
+status **1**, also after a graceful interrupt. A connection-stage abort still
+exits with **2** when an output write fails too.
+
+One exception: when stdout is a pipe or socket and its reader has gone
+away (e.g. `memtier_benchmark ... | head`), the run is not failed, since the
+reader chose to stop reading. This also applies to an `--out-file` that is
+the same file as stdout, such as `/dev/stdout`. A write that fails while the
+reader is still there (for example a full non-blocking pipe) still fails the
+run. Any other `--out-file` (for example a FIFO whose reader exits) and
+`--json-out-file` always fail the run when a write fails.
+
+Not covered yet: write errors on the HDR histogram files
+(`--hdr-file-prefix`), the `--client-stats` CSV files and
+`--failed-keys-file` are still not checked.
 
 ## Crash Reporting
 

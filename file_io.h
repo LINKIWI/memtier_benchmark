@@ -64,4 +64,9 @@ public:
     bool write_item(memcache_item *item);
 };
 
+/** Flushes fp and, if do_close is true, closes it. Returns 0 if every write
+ * to fp reached the OS, otherwise an errno value describing the failure (EIO
+ * when an earlier write failed and its errno is no longer known). */
+int finish_output_file(FILE *fp, bool do_close);
+
 #endif /* _FILE_IO_H */
