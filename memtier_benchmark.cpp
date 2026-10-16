@@ -2731,7 +2731,9 @@ void usage()
         "met, memtier will do as many requests as possible per second.\n"
         "  -c, --clients=NUMBER           Number of clients per thread (default: 50)\n"
         "  -t, --threads=NUMBER           Number of threads (default: 4)\n"
-        "      --test-time=SECS           Number of seconds to run the test\n"
+        "      --test-time=SECS           Number of seconds to run the test. Replies to requests already sent\n"
+        "                                 are waited for at most 10 more seconds; requests still unanswered\n"
+        "                                 then are abandoned and counted as errors.\n"
         "      --clients-start=NUMBER     Starting number of clients per thread for staircase ramp-up.\n"
         "                                 Must be less than --clients. Requires --clients-step and --step-duration.\n"
         "      --clients-step=NUMBER      Number of clients to add per step in staircase ramp-up.\n"
@@ -3598,6 +3600,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
         (*i)->start();
     }
+    struct timeval launch_time;
+    gettimeofday(&launch_time, NULL);
 
     // Send "run started" annotation to Graphite
     if (cfg->statsd != NULL && cfg->statsd->is_enabled()) {
@@ -3718,8 +3722,24 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
         unsigned long long int total_retry_attempts = 0;
         unsigned long long int total_retried_ops = 0;
 
+        // Replies still pending well after --test-time (the server stopped
+        // replying) would otherwise keep the run waiting forever. Each client
+        // checks its own deadline (its own start, or the staircase start), so
+        // one that connected late is ended a tick or two later; this only says
+        // when to start asking.
+        bool end_stalled = false;
+        if (cfg->test_time > 0) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            end_stalled =
+                ts_diff(launch_time, now) >= (long long) (cfg->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000;
+        }
+
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
-            if (!(*i)->m_finished) active_threads++;
+            if (!(*i)->m_finished) {
+                active_threads++;
+                if (end_stalled) (*i)->m_cg->end_stalled_clients();
+            }
 
             total_ops += (*i)->m_cg->get_total_ops();
             total_bytes += (*i)->m_cg->get_total_bytes();

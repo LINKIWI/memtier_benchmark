@@ -391,6 +391,36 @@ void client::set_end_time_keep_live_totals(bool keep_live_totals)
     }
 }
 
+unsigned int client::abandon_unanswered_requests(void)
+{
+    if (m_end_set || m_config->test_time == 0) return 0;
+    if (m_stats.get_duration_usec() < (unsigned long long) (m_config->test_time + TEST_TIME_DRAIN_GRACE_SECS) * 1000000)
+        return 0;
+
+    // Only a client that is waiting for replies: one with nothing in flight
+    // ends by itself, or is waiting for a reconnect.
+    if (all_connections_idle()) return 0;
+
+    // Drop them before disconnecting, so --retry-on-error does not hold them
+    // for a resend that will never come (disconnect_all() would then count
+    // them a second time). Workload requests that never got a reply are
+    // errors, not ops (drop_pending_requests() counts them through
+    // abandon_requests()); setup commands are not counted.
+    unsigned int abandoned = 0;
+    for (unsigned int i = 0; i < m_connections.size(); i++) {
+        if (m_connections[i] != NULL) abandoned += m_connections[i]->drop_pending_requests();
+    }
+    m_stats.add_unanswered_requests(abandoned);
+
+    // The run measured --test-time, not the grace period spent waiting.
+    struct timeval end_time = m_stats.get_start_time();
+    end_time.tv_sec += m_config->test_time;
+    m_stats.set_end_time(&end_time);
+    m_end_set = true;
+    disconnect_all();
+    return abandoned;
+}
+
 bool client::hold_pipeline(unsigned int conn_id)
 {
     // don't exceed requests
@@ -872,7 +902,7 @@ int client::prepare(void)
 }
 
 // Maps internal request_type to a short uppercase string for failed-keys logs.
-static const char *request_type_to_name(request_type t)
+const char *request_type_to_name(request_type t)
 {
     switch (t) {
     case rt_get:
@@ -1461,6 +1491,48 @@ void client_group::handle_staircase_step(void)
             event_free(m_staircase_timer);
             m_staircase_timer = NULL;
         }
+    }
+}
+
+// Called from the main thread once a --test-time run is
+// TEST_TIME_DRAIN_GRACE_SECS past its deadline and this thread has not ended.
+// The clients belong to the worker thread, so hand the work to its event loop
+// (this also wakes it from a poll that has nothing left to deliver).
+void client_group::end_stalled_clients(void)
+{
+    struct timeval zero = {0, 0};
+    event_base_once(m_base, -1, EV_TIMEOUT, end_stalled_clients_cb, (void *) this, &zero);
+}
+
+void client_group::end_stalled_clients_cb(evutil_socket_t fd, short what, void *arg)
+{
+    (void) fd;
+    (void) what;
+    ((client_group *) arg)->handle_end_stalled_clients();
+}
+
+void client_group::handle_end_stalled_clients(void)
+{
+    unsigned long long abandoned = 0;
+    unsigned int stalled = 0;
+    unsigned int count = active_client_count();
+    for (unsigned int i = 0; i < count && i < m_clients.size(); i++) {
+        if (m_clients[i]->end_time_set()) continue;
+        abandoned += m_clients[i]->abandon_unanswered_requests();
+        if (m_clients[i]->end_time_set()) stalled++;
+    }
+    if (stalled > 0) {
+        // The deadline has passed, so the ramp is over. Do not let its
+        // persistent timer keep the loop alive until the next step.
+        if (m_staircase_timer != NULL) {
+            event_del(m_staircase_timer);
+            event_free(m_staircase_timer);
+            m_staircase_timer = NULL;
+        }
+        benchmark_error_log("warning: %u client(s) got no reply to %llu request(s) %u seconds after the test time "
+                            "ended; abandoned them (counted as errors, \"Unanswered requests\" in the JSON "
+                            "Runtime).\n",
+                            stalled, abandoned, TEST_TIME_DRAIN_GRACE_SECS);
     }
 }
 

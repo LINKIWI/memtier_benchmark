@@ -1033,6 +1033,24 @@ void shard_connection::drain_replay_queue_after_reconnect()
     if (dropped) m_conns_manager->abandon_requests(dropped);
 }
 
+unsigned int shard_connection::drop_pending_requests()
+{
+    unsigned int dropped = 0;
+    while (m_pending_resp) {
+        request *req = pop_req();
+        if (is_workload_request(req->m_type)) {
+            struct timeval now;
+            gettimeofday(&now, NULL);
+            global_failed_keys_logger().log_failure(now, request_type_to_name(req->m_type), req->m_key, req->m_key_len,
+                                                    "no-reply-after-test-time", req->m_retries);
+            dropped++;
+        }
+        delete req;
+    }
+    if (dropped) m_conns_manager->abandon_requests(dropped);
+    return dropped;
+}
+
 request *shard_connection::pop_replay_request()
 {
     // disconnect() moves the retry queue into the replay queue, but take

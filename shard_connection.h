@@ -320,6 +320,11 @@ public:
     // fill_pipeline() once that connection is connected and set up, never
     // from inside the refresh.
     request *pop_replay_request();
+    // Drops the requests still waiting for a reply (the run is over and the
+    // server stopped answering), so they are neither resent nor waited for.
+    // Returns how many of them were workload requests; those are also logged
+    // to --failed-keys-file as "no-reply-after-test-time".
+    unsigned int drop_pending_requests();
     void adopt_replay_request(request *req);
     // Give up on every request held for resend: log each one to
     // --failed-keys-file with `reason` and count it as an error. Returns how
