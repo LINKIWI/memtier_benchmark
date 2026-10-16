@@ -5206,8 +5206,17 @@ int main(int argc, char *argv[])
         std::vector<run_stats> all_stats;
         all_stats.reserve(cfg.run_count);
 
+        // Ctrl+C ends the whole --run-count series, not only the current run:
+        // no later run starts. g_interrupted is checked before and after the
+        // settle pause, since the signal can arrive during it. The interrupted
+        // run itself is kept, marked Interrupted. Run 1 always runs, so
+        // all_stats is never empty.
         for (unsigned int run_id = 1; run_id <= cfg.run_count; run_id++) {
-            if (run_id > 1) sleep(1); // let connections settle
+            if (run_id > 1) {
+                if (g_interrupted) break;
+                sleep(1); // let connections settle
+                if (g_interrupted) break;
+            }
 
             run_stats stats = run_benchmark(run_id, &cfg, obj_gen);
             all_stats.push_back(stats);
@@ -5215,6 +5224,11 @@ int main(int argc, char *argv[])
             stats.save_hdr_get_command(&cfg, run_id);
             stats.save_hdr_set_command(&cfg, run_id);
             stats.save_hdr_arbitrary_commands(&cfg, run_id);
+        }
+        const bool series_cut = all_stats.size() < cfg.run_count;
+        if (series_cut) {
+            fprintf(stderr, "Interrupted by user (Ctrl+C), skipping the remaining runs (%zu of %u done).\n",
+                    all_stats.size(), cfg.run_count);
         }
         //
         // Print some run information.
@@ -5271,6 +5285,8 @@ int main(int argc, char *argv[])
 
         fprintf(outfile, "%-9llu %s\n", (unsigned long long) (cfg.requests > 0 ? cfg.requests : cfg.test_time),
                 cfg.requests > 0 ? "Requests per client" : "Seconds");
+        if (series_cut)
+            fprintf(outfile, "%-9zu Runs completed (of %u, interrupted)\n", all_stats.size(), cfg.run_count);
 
         if (jsonhandler != NULL) {
             jsonhandler->open_nesting("run information");
@@ -5285,6 +5301,7 @@ int main(int argc, char *argv[])
             }
             jsonhandler->write_obj(cfg.requests > 0 ? "Requests per client" : "Seconds", "%llu",
                                    cfg.requests > 0 ? cfg.requests : (unsigned long long) cfg.test_time);
+            jsonhandler->write_obj("Runs completed", "%zu", all_stats.size());
             jsonhandler->write_obj("Format version", "%d", 2);
             jsonhandler->close_nesting();
         }
@@ -5303,7 +5320,9 @@ int main(int argc, char *argv[])
 #endif
 
         // If more than 1 run was used, compute best, worst and average
-        // Furthermore, if print_all_runs is enabled we save separate histograms per run
+        // Furthermore, if print_all_runs is enabled we save separate histograms per run.
+        // The section names follow --run-count, so JSON keys stay stable; their
+        // contents use only the runs that happened ("Runs completed" above).
         if (cfg.run_count > 1) {
             // User wants to see a separate histogram per run
             if (cfg.print_all_runs) {
@@ -5336,6 +5355,10 @@ int main(int argc, char *argv[])
             // average results:
             run_stats average(&cfg);
             average.aggregate_average(all_stats);
+            // Each run (and BEST/WORST, which are runs) keeps its own flag. The
+            // average is interrupted if any run was, or if Ctrl+C cut the
+            // series short, even between runs where no single run saw it.
+            if (series_cut) average.set_interrupted(true);
             char average_header[50];
             snprintf(average_header, sizeof(average_header), "AGGREGATED AVERAGE RESULTS (%u runs)", cfg.run_count);
             average.print(outfile, &cfg, average_header, jsonhandler);
