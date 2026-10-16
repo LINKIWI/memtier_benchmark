@@ -48,6 +48,7 @@
 #include <sys/resource.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -5049,14 +5050,6 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    // JSON file initiation
-    json_handler *jsonhandler = NULL;
-    if (cfg.json_out_file != NULL) {
-        jsonhandler = new json_handler((const char *) cfg.json_out_file);
-        // We allways print the configuration to the JSON file
-        config_print_to_json(jsonhandler, &cfg);
-    }
-
     struct rlimit rlim;
     if (getrlimit(RLIMIT_NOFILE, &rlim) != 0) {
         benchmark_error_log("error: getrlimit failed: %s\n", strerror(errno));
@@ -5250,17 +5243,46 @@ int main(int argc, char *argv[])
         obj_gen->set_key_zipf_distribution(cfg.key_zipf_exp);
     }
 
-    // Prepare output file
-    FILE *outfile;
+    // Prepare output files. This comes after all option validation and the
+    // data-import loading, so a startup error leaves an existing --out-file
+    // and --json-out-file untouched. Nothing has connected yet.
+    // --out-file is opened without O_TRUNC and only truncated once the
+    // --json-out-file has been opened too, so an error opening either one
+    // leaves the other untouched. Fail now rather than run the whole
+    // benchmark and then write the results to a NULL FILE*. Retry on EINTR,
+    // as json_handler does.
+    FILE *outfile = stdout;
+    if (cfg.out_file != NULL) {
+        int fd;
+        do {
+            fd = open(cfg.out_file, O_WRONLY | O_CREAT, 0666);
+        } while (fd < 0 && errno == EINTR);
+        if (fd < 0 || (outfile = fdopen(fd, "w")) == NULL) {
+            fprintf(stderr, "error: cannot open --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            exit(1);
+        }
+    }
+
+    // JSON file initiation
+    json_handler *jsonhandler = NULL;
+    if (cfg.json_out_file != NULL) {
+        jsonhandler = new json_handler((const char *) cfg.json_out_file);
+        // We allways print the configuration to the JSON file
+        config_print_to_json(jsonhandler, &cfg);
+    }
+
     if (cfg.out_file != NULL) {
         fprintf(stderr, "Writing results to %s...\n", cfg.out_file);
-        outfile = fopen(cfg.out_file, "w");
-        if (!outfile) {
-            perror(cfg.out_file);
+        // Only regular files can be truncated (not e.g. /dev/stdout or a FIFO).
+        struct stat st;
+        if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
+            fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
+            // Close the JSON nesting, so the --json-out-file stays valid.
+            delete jsonhandler;
+            exit(1);
         }
     } else {
         fprintf(stderr, "Writing results to stdout\n");
-        outfile = stdout;
     }
 
     if (!cfg.verify_only) {
