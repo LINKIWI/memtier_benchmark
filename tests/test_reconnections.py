@@ -1,5 +1,10 @@
 import json
+import math
+import os
 import re
+import signal
+import socket
+import subprocess
 import tempfile
 import time
 import threading
@@ -487,6 +492,290 @@ def test_reconnect_disabled_by_default(env):
     if not killed:
         env.debugPrint("WARNING: No connections were killed", True)
     env.assertTrue(killed)
+
+
+def _refusing_socket():
+    """A bound socket that does not listen: connects to its port are refused.
+
+    Holding it for the whole run keeps the port from being reused by another
+    process, which closing a probe socket before the run would not.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    return sock
+
+
+def _dead_server_args(env, port, json_path, extra_args):
+    tls_specs = {"args": []}
+    addTLSArgs(tls_specs, env)
+    return [
+        MEMTIER_BINARY,
+        "--server=127.0.0.1",
+        "--port={}".format(port),
+        "--threads=1",
+        "--clients=2",
+        "--reconnect-on-error",
+        "--connection-stage-timeout=0",
+        "--connection-timeout=1",
+        "--hide-histogram",
+        "--json-out-file={}".format(json_path),
+    ] + tls_specs["args"] + extra_args
+
+
+def _logged_reconnect_errors(stderr):
+    """Connection errors that attempt_reconnect() logged.
+
+    Each call counts one connection error and logs either an "attempting
+    reconnection" line or the final "Maximum reconnection attempts" line.
+    Unlike the "Connection error: " line before it, which is "TLS connection
+    error: " over TLS and missing when errno is 0, this is the same for every
+    transport. A duplicate call while a reconnect is pending is counted but
+    not logged, so the counter can be higher.
+    """
+    return len(
+        re.findall(
+            r"attempting reconnection \d+(?:/\d+| \(unlimited\))|Maximum reconnection attempts \(\d+\) exceeded",
+            stderr,
+        )
+    )
+
+
+def _assert_time_series_within(env, results, max_second):
+    """Every "Time-Serie" second is within the run, none keyed from the epoch."""
+    bad = []
+
+    def walk(value, path):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if k == "Time-Serie" and isinstance(v, dict):
+                    bad.extend("{}/{}".format(path, s) for s in v if int(s) > max_second)
+                else:
+                    walk(v, path + "/" + k)
+
+    walk(results, "")
+    env.assertEqual(bad[:5], [])
+
+
+def _assert_no_null_stats(env, results):
+    """No NaN (written as null) or infinite value outside "configuration"."""
+    bad = []
+
+    def walk(value, path):
+        if isinstance(value, dict):
+            for k, v in value.items():
+                walk(v, path + "/" + k)
+        elif isinstance(value, list):
+            for i, v in enumerate(value):
+                walk(v, "{}/{}".format(path, i))
+        elif value is None or (isinstance(value, float) and not math.isfinite(value)):
+            bad.append(path)
+
+    for section, value in results.items():
+        if section != "configuration":
+            walk(value, "/" + section)
+    env.assertEqual(bad, [])
+
+
+def _assert_zero_rates(env, stats):
+    for cmd in ("Sets", "Gets", "Waits", "Totals"):
+        for field in ("Ops/sec", "KB/sec", "KB/sec RX", "KB/sec TX"):
+            env.assertEqual(stats[cmd][field], 0.0, message="{} {}".format(cmd, field))
+
+
+def test_connection_errors_reported_when_server_never_reachable(env):
+    """Clients that never connect keep their connection errors (issue #702).
+
+    No connection ever succeeds, so no client sets a start time. The final
+    report used to skip those clients and print Connection Errors 0, although
+    the live line counted every failed connect. The run has no duration, so
+    every rate must be 0, not NaN (JSON null).
+    """
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    json_path = os.path.join(test_dir, "mb.json")
+    refusing = _refusing_socket()
+    try:
+        result = subprocess.run(
+            _dead_server_args(
+                env, refusing.getsockname()[1], json_path, ["--max-reconnect-attempts=2", "--test-time=30"]
+            ),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    finally:
+        refusing.close()
+    # One failed connect and two failed reconnects at least; the thread ends
+    # when its first client runs out of attempts. Each of the 2 clients makes
+    # at most 1 + 2 attempts.
+    logged = _logged_reconnect_errors(result.stderr)
+    env.assertGreaterEqual(logged, 3, message=result.stderr[-2000:])
+    with open(json_path) as f:
+        results = json.load(f)
+    stats = results["ALL STATS"]
+    env.assertGreaterEqual(stats["Totals"]["Connection Errors"], logged, message=repr(stats["Totals"]))
+    env.assertLessEqual(stats["Totals"]["Connection Errors"], 2 * (1 + 2), message=repr(stats["Totals"]))
+    _assert_zero_rates(env, stats)
+    _assert_no_null_stats(env, results)
+    _assert_time_series_within(env, results, 31)
+
+
+def test_ctrl_c_reported_when_server_never_reachable(env):
+    """A Ctrl+C before any client connects is reported (issue #702).
+
+    The "after N secs" message used the client durations, which stay 0 until
+    a client connects, and the JSON lost the interrupted flag together with
+    the clients that never started.
+    """
+    env.skipOnCluster()
+    test_dir = tempfile.mkdtemp()
+    json_path = os.path.join(test_dir, "mb.json")
+    refusing = _refusing_socket()
+    proc = subprocess.Popen(
+        _dead_server_args(env, refusing.getsockname()[1], json_path, ["--test-time=30"]),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        time.sleep(3)
+        proc.send_signal(signal.SIGINT)
+        try:
+            _, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            env.assertTrue(False, message="memtier did not exit after SIGINT")
+            return
+    finally:
+        refusing.close()
+    match = re.search(r"Interrupted by user \(Ctrl\+C\) after ([0-9.]+) secs", stderr)
+    env.assertTrue(match is not None, message=stderr[-2000:])
+    if match is None:
+        return
+    env.assertGreaterEqual(float(match.group(1)), 2.0, message=match.group(0))
+    with open(json_path) as f:
+        results = json.load(f)
+    stats = results["ALL STATS"]
+    env.assertEqual(stats["Runtime"]["Interrupted"], "true", message=repr(stats["Runtime"]))
+    # Each logged attempt is counted once; a refused connect reports one
+    # error, so at most one more per client may be counted without a log line.
+    logged = _logged_reconnect_errors(stderr)
+    env.assertGreaterEqual(logged, 2, message=stderr[-2000:])
+    env.assertGreaterEqual(stats["Totals"]["Connection Errors"], logged, message=repr(stats["Totals"]))
+    env.assertLessEqual(stats["Totals"]["Connection Errors"], logged + 2, message=repr(stats["Totals"]))
+    _assert_zero_rates(env, stats)
+    _assert_no_null_stats(env, results)
+    _assert_time_series_within(env, results, 31)
+
+
+def test_connection_errors_reported_when_only_a_later_client_connects(env):
+    """A client that never connects, merged before one that did (issue #702).
+
+    Client 0 is refused on every attempt; client 1, added by the staircase
+    ramp after 3 s, connects through a proxy that accepts one connection.
+    The final report must count client 0's connection errors, and its zero
+    timestamps must not enter the merged run time. Client 1 uses the run's
+    start time, and the thread ends when client 0's last dial fails at 6 s,
+    so the run lasts about 6 s; averaging in client 0 would halve it.
+    """
+    env.skipOnCluster()
+    upstream = env.getMasterNodesList()[0]
+    if upstream.get("unix_socket_path"):
+        env.skip()
+    test_dir = tempfile.mkdtemp()
+    json_path = os.path.join(test_dir, "mb.json")
+
+    # Bound but not listening (connects are refused) until client 0's second
+    # attempt has failed; it then accepts the next connection, client 1's,
+    # forwards it to Redis and stops listening, so client 0 stays refused.
+    proxy = _refusing_socket()
+    port = proxy.getsockname()[1]
+    args = _dead_server_args(
+        env,
+        port,
+        json_path,
+        [
+            "--clients-start=1",
+            "--clients-step=1",
+            "--step-duration=3",
+            "--reconnect-backoff-factor=2",
+            "--max-reconnect-attempts=2",
+            "--test-time=8",
+        ],
+    )
+    # Delays are 2 s and 4 s: client 0 dials at 0 s, 2 s and 6 s, client 1 at
+    # 3 s. Client 0's last dial fails at 6 s, before the 8 s deadline, so it
+    # happens whether or not reconnects stop at the deadline.
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    stderr = bytearray()
+    second_failure = threading.Event()
+
+    def read_stderr():
+        while True:
+            chunk = proc.stderr.read1(4096)
+            if not chunk:
+                return
+            stderr.extend(chunk)
+            if b"attempting reconnection 2/2" in stderr:
+                second_failure.set()
+
+    reader = threading.Thread(target=read_stderr, daemon=True)
+    reader.start()
+    pumps = []
+    try:
+        env.assertTrue(second_failure.wait(20), message=stderr.decode(errors="replace")[-2000:])
+        proxy.listen(1)
+        proxy.settimeout(5)
+        conn, _ = proxy.accept()
+        proxy.close()
+        up = socket.create_connection(("127.0.0.1", upstream["port"]))
+
+        def pump(src, dst):
+            try:
+                while True:
+                    data = src.recv(65536)
+                    if not data:
+                        break
+                    dst.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for s in (src, dst):
+                    try:
+                        s.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+
+        for src, dst in ((conn, up), (up, conn)):
+            t = threading.Thread(target=pump, args=(src, dst), daemon=True)
+            t.start()
+            pumps.append(t)
+        proc.wait(timeout=60)
+    finally:
+        proxy.close()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+    reader.join(10)
+    text = stderr.decode(errors="replace")
+    # Client 0 makes at most 1 + 2 attempts, at least the 2 the proxy waited
+    # for; client 1 keeps its connection. Compare with what memtier logged.
+    logged = _logged_reconnect_errors(text)
+    env.assertGreaterEqual(logged, 2, message=text[-2000:])
+    with open(json_path) as f:
+        results = json.load(f)
+    stats = results["ALL STATS"]
+    totals = stats["Totals"]
+    env.assertGreaterEqual(totals["Connection Errors"], logged, message=repr(totals))
+    env.assertLessEqual(totals["Connection Errors"], 1 + 2, message=repr(totals))
+    env.assertGreater(totals["Count"], 0, message=repr(totals))
+    duration_ms = stats["Runtime"]["Total duration"]
+    env.assertGreaterEqual(duration_ms, 5000, message=repr(stats["Runtime"]))
+    env.assertLessEqual(duration_ms, 12000, message=repr(stats["Runtime"]))
+    env.assertAlmostEqual(totals["Ops/sec"], totals["Count"] * 1000.0 / duration_ms, delta=totals["Ops/sec"] * 0.05)
+    _assert_no_null_stats(env, results)
+    _assert_time_series_within(env, results, 8 + 1)
 
 
 def test_reconnect_backoff_cap_60s(env):
