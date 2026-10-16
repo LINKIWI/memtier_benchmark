@@ -1004,6 +1004,40 @@ def test_uri_with_database_selection(env):
     env.assertTrue(memtier_ok)
 
 
+def test_uri_ipv6_bracketed_host(env):
+    """--uri accepts a bracketed IPv6 host, like redis-cli -u (issue #701)."""
+    env.skipOnUnixSocket()
+    master_nodes_list = env.getMasterNodesList()
+    port = master_nodes_list[0]['port']
+    if master_nodes_list[0].get('host') not in (None, 'localhost', '127.0.0.1'):
+        env.skip()
+    import socket
+    try:
+        socket.create_connection(('::1', port), timeout=2).close()
+    except OSError:
+        env.debugPrint('server not reachable on [::1]:{}, skipping'.format(port), force=True)
+        env.skip()
+
+    # Decoy --server/--port that the URI must override: if the bracketed host
+    # or its port were dropped, memtier would try the decoy and fail.
+    benchmark_specs = {"name": env.testName,
+                       "args": ['--server=host-must-be-overridden.invalid', '--port=1',
+                                '--uri=redis://[::1]:{}'.format(port), '--ratio=1:0', '--hide-histogram',
+                                '--connection-stage-timeout=5']}
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=1, clients=1, requests=50)
+    config['memtier_benchmark']['explicit_connect_args'] = True
+    add_required_env_arguments(benchmark_specs, config, env, master_nodes_list)
+
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    memtier_ok = benchmark.run()
+    debugPrintMemtierOnError(config, env)
+    env.assertTrue(memtier_ok)
+
+
 def test_uri_authentication_ownership(env):
     """URI fields own storage; omitted fields retain CLI credentials and CLI/default hosts."""
     env.skipOnUnixSocket()
