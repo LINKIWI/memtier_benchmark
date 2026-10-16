@@ -321,6 +321,14 @@ public:
     // from inside the refresh.
     request *pop_replay_request();
     void adopt_replay_request(request *req);
+    // Give up on every request held for resend: log each one to
+    // --failed-keys-file with `reason` and count it as an error. Returns how
+    // many were dropped.
+    unsigned long long abandon_replay_requests(const char *reason);
+    // Why this connection ended its thread early, if it did: the reason
+    // client_group::run() logs its held requests with. NULL otherwise.
+    void set_thread_end_reason(const char *reason) { m_thread_end_reason = reason; }
+    const char *get_thread_end_reason() const { return m_thread_end_reason; }
     // Capture bytes added between `before_pos` and the current evbuffer length
     // into req->m_serialized. No-op when retry is globally disabled.
     void capture_serialized_bytes(size_t before_pos, request *req);
@@ -439,6 +447,7 @@ private:
     bool m_reconnecting;
     // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
     bool m_setup_rejected;
+    const char *m_thread_end_reason;
 
     // Connection timeout tracking
     struct event *m_connection_timeout_timer;
