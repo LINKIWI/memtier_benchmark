@@ -62,6 +62,15 @@
 static const double MEMTIER_BACKOFF_CAP_SEC = 60.0;
 static const double MEMTIER_BACKOFF_CAP_MS = 60000.0;
 
+// Minimum reconnect delay enforced after every backoff multiplication. A
+// --reconnect-backoff-factor below 1 shrinks the delay on each attempt; with no
+// floor it reaches 0 s after a few attempts and a dead server is reconnected in
+// a tight loop (hundreds of thousands of attempts and log lines per second).
+// 100 ms still reconnects quickly while bounding each connection to ~10
+// attempts per second. Factor 0 does not multiply, so it keeps the constant
+// 1 s delay; a tiny positive factor settles at this floor instead.
+static const double MEMTIER_RECONNECT_MIN_DELAY_SEC = 0.1;
+
 // Workload requests count toward the client's generated/processed totals and
 // per-endpoint routed ops; connection-setup requests do not. A switch, so a
 // new request_type must be classified here.
@@ -1814,6 +1823,8 @@ void shard_connection::attempt_reconnect(const char *error_context)
         if (m_config->reconnect_backoff_factor > 0.0) {
             m_current_backoff_delay *= m_config->reconnect_backoff_factor;
             if (m_current_backoff_delay > MEMTIER_BACKOFF_CAP_SEC) m_current_backoff_delay = MEMTIER_BACKOFF_CAP_SEC;
+            if (m_current_backoff_delay < MEMTIER_RECONNECT_MIN_DELAY_SEC)
+                m_current_backoff_delay = MEMTIER_RECONNECT_MIN_DELAY_SEC;
         }
 
         if (m_config->max_reconnect_attempts == 0) {
@@ -1941,6 +1952,8 @@ void shard_connection::handle_reconnect_timer_event()
                 m_current_backoff_delay *= m_config->reconnect_backoff_factor;
                 if (m_current_backoff_delay > MEMTIER_BACKOFF_CAP_SEC)
                     m_current_backoff_delay = MEMTIER_BACKOFF_CAP_SEC;
+                if (m_current_backoff_delay < MEMTIER_RECONNECT_MIN_DELAY_SEC)
+                    m_current_backoff_delay = MEMTIER_RECONNECT_MIN_DELAY_SEC;
             }
 
             benchmark_error_log("Reconnection attempt %u failed, retrying in %.2f seconds...\n", m_reconnect_attempts,
