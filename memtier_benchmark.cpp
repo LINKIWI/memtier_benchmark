@@ -2479,10 +2479,10 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
     }
 
     // --transaction needs at least one --command to operate on. In
-    // --cluster-mode the flag changes routing; in standalone it is a no-op
-    // (each client has a single connection, so the rotation already runs
-    // through one socket in order), but we accept it so scripts that toggle
-    // --cluster-mode don't have to also toggle --transaction.
+    // --cluster-mode it also pins each rotation to one shard connection; in
+    // standalone each client already has a single connection, so it only
+    // keeps every __key__ of a rotation on the same key and skips the rest
+    // of a MULTI block after a reconnect.
     if (cfg->transaction && !cfg->arbitrary_commands->is_defined()) {
         fprintf(stderr, "error: --transaction requires at least one --command.\n");
         return -1;
@@ -2591,9 +2591,12 @@ void usage()
         "                                 --pipeline > 1 is supported: in --cluster-mode each rotation is\n"
         "                                 sent contiguously on its pinned connection, so multiple whole\n"
         "                                 transactions can be in flight without interleaving MULTI/EXEC.\n"
-        "                                 Note: if --reconnect-on-error triggers mid-rotation, the\n"
-        "                                 interrupted rotation's stats will be inaccurate (server-side\n"
-        "                                 WATCH/MULTI state is lost on reconnect).\n"
+        "                                 Note: a reconnect (e.g. --reconnect-on-error) loses the\n"
+        "                                 server-side WATCH/MULTI state. If it happens inside a MULTI\n"
+        "                                 block, the rest of that block, through its EXEC/DISCARD, is\n"
+        "                                 skipped and not counted, so the per-command counts no longer\n"
+        "                                 follow the command ratio. Replies already received for that\n"
+        "                                 block stay counted.\n"
         "                                 --retry-on-error does not retry or replay --transaction\n"
         "                                 commands.\n"
         "  -h, --help                     Display this help\n"
