@@ -190,8 +190,11 @@ static bool check_cluster_monitor_lines(const struct monitor_command_list *monit
 // even on memory-constrained hosts.
 #define MAX_RUN_COUNT 1024
 
-// Global flag for signal handling
-static volatile sig_atomic_t g_interrupted = 0;
+// Global flag for signal handling: 0, or the number of the signal
+// (SIGINT / SIGTERM) that interrupted the run. Atomic, not a volatile
+// sig_atomic_t: the kernel may run the handler on a worker thread while the
+// main thread reads the flag.
+static std::atomic<int> g_interrupted(0);
 
 // Set when run_benchmark() aborts because --connection-stage-timeout
 // elapsed without any thread reaching steady state. main() reads it after
@@ -381,11 +384,41 @@ static void install_alt_signal_stack(void)
     }
 }
 
-// Signal handler for Ctrl+C
+// CLOCK_MONOTONIC time of the first SIGINT/SIGTERM, in ms modulo 2^32, and
+// never 0: 0 means no signal yet. Differences are taken modulo 2^32 too, so
+// the wrap every ~49.7 days does not matter.
+static std::atomic<unsigned int> g_first_interrupt_ms(0);
+
+// The handler uses only int-sized atomics; that is async-signal-safe only
+// when they are lock-free.
+static_assert(ATOMIC_INT_LOCK_FREE == 2, "sigint_handler needs lock-free int atomics");
+
+// Signal handler for Ctrl+C (SIGINT) and SIGTERM. The first signal stops
+// the run gracefully. A signal at least 1 s later terminates at once, as a
+// way out of a stuck shutdown. Signals within that second are duplicates of
+// the same action and are ignored: Ctrl+C under `timeout` delivers SIGINT
+// twice (terminal and timeout), and a process-group kill does the same.
 static void sigint_handler(int signum)
 {
-    (void) signum; // unused parameter
-    g_interrupted = 1;
+    int saved_errno = errno;
+    struct timespec ts;
+    // clock_gettime() is async-signal-safe (POSIX.1-2008).
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned int now = (unsigned int) ts.tv_sec * 1000u + (unsigned int) (ts.tv_nsec / 1000000);
+    if (now == 0) now = 1;
+    unsigned int first = 0;
+    if (g_first_interrupt_ms.compare_exchange_strong(first, now)) {
+        g_interrupted = signum;
+    } else if (now - first >= 1000u) {
+        signal(signum, SIG_DFL);
+        raise(signum);
+    }
+    errno = saved_errno;
+}
+
+static const char *interrupt_source(void)
+{
+    return g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)";
 }
 
 // Crash handler - prints stack trace and other debugging information
@@ -2653,7 +2686,8 @@ void usage()
         "of 'TLSv1', 'TLSv1.1', 'TLSv1.2' and 'TLSv1.3'.\n"
         "      --sni=STRING               Add an SNI header\n"
 #endif
-        "  -x, --run-count=NUMBER         Number of full-test iterations to perform\n"
+        "  -x, --run-count=NUMBER         Number of full-test iterations to perform. Ctrl+C or SIGTERM\n"
+        "                                 ends the series after the current run\n"
         "  -D, --debug                    Print debug output\n"
         "      --cluster-mode             Run client in cluster mode\n"
         "      --transaction              Treat one full rotation of --command entries as a transactional\n"
@@ -3692,8 +3726,8 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
                 float factor = ((float) (thread_counter - 1) / thread_counter);
                 elapsed_duration = factor * elapsed_duration + (float) (*i)->m_cg->get_duration_usec() / thread_counter;
             }
-            fprintf(stderr, "\n[RUN #%u] Interrupted by user (Ctrl+C) after %.1f secs, stopping threads...\n", run_id,
-                    (float) elapsed_duration / 1000000);
+            fprintf(stderr, "\n[RUN #%u] Interrupted by %s after %.1f secs, stopping threads...\n", run_id,
+                    interrupt_source(), (float) elapsed_duration / 1000000);
             // Interrupt all threads (marks clients as interrupted, breaks event loops, and finalizes stats)
             for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
                 (*i)->m_cg->interrupt();
@@ -4409,8 +4443,11 @@ int main(int argc, char *argv[])
         fprintf(stderr, "warning: evthread_use_pthreads() failed; cross-thread loop wakeups may stall.\n");
     }
 
-    // Install signal handler for Ctrl+C
+    // Install signal handler for Ctrl+C. SIGTERM (kill, timeout, docker stop,
+    // CI runners) takes the same graceful path, so results are printed and
+    // --json-out-file is closed as valid JSON instead of left truncated.
     signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
 
     // Ignore SIGPIPE so a peer-initiated TCP/TLS close mid-write returns
     // EPIPE from send()/SSL_write() instead of killing the process. Without
@@ -5216,7 +5253,7 @@ int main(int argc, char *argv[])
         std::vector<run_stats> all_stats;
         all_stats.reserve(cfg.run_count);
 
-        // Ctrl+C ends the whole --run-count series, not only the current run:
+        // Ctrl+C (or SIGTERM) ends the whole --run-count series, not only the current run:
         // no later run starts. g_interrupted is checked before and after the
         // settle pause, since the signal can arrive during it. The interrupted
         // run itself is kept, marked Interrupted. Run 1 always runs, so
@@ -5237,7 +5274,7 @@ int main(int argc, char *argv[])
         }
         const bool series_cut = all_stats.size() < cfg.run_count;
         if (series_cut) {
-            fprintf(stderr, "Interrupted by user (Ctrl+C), skipping the remaining runs (%zu of %u done).\n",
+            fprintf(stderr, "Interrupted by %s, skipping the remaining runs (%zu of %u done).\n", interrupt_source(),
                     all_stats.size(), cfg.run_count);
         }
         //
