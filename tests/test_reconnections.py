@@ -1416,3 +1416,97 @@ def test_auth_failure_on_reconnect_with_retry_on_error_honors_test_time(env):
     env.assertTrue("held for retry when the run ended were not resent" in stderr_content,
                    message="requests held for replay were not counted when the run ended")
     env.assertLess(elapsed, test_time + 5, message="run took {:.1f}s for --test-time={}".format(elapsed, test_time))
+
+
+def test_merged_duration_averages_all_threads(env):
+    """
+    With several threads, the JSON Start time / Finish time / Total duration
+    (and so every rate) are the average over all clients. merge_run_stats()
+    restarted the averaging weight for each thread, so each thread's first
+    client replaced the average built so far and the result came only from
+    the last thread's clients (#709).
+
+    Four threads with one rate-limited client each take about 3 s for
+    --requests=300. One client is disconnected once and, with
+    --reconnect-backoff-factor=3, waits 3 s before reconnecting, so it ends
+    about 3 s later: the rate limiter resets its budget on disconnect and
+    refills it per interval after the reconnect, so it does not catch up on
+    the missed requests. The mean over all four clients is about 3.75 s.
+    The killed client is the first to connect, so it is not in the last
+    thread, and the last thread alone reports about 3 s.
+    """
+    env.skipOnCluster()
+    requests, rate, reconnect_delay_ms = 300, 100, 3000
+    benchmark_specs = {
+        "name": env.testName,
+        "args": [
+            "--pipeline=1",
+            "--rate-limiting={}".format(rate),
+            "--ratio=1:1",
+            "--key-pattern=R:R",
+            "--key-minimum=1",
+            "--key-maximum=1000",
+            "--reconnect-on-error",
+            "--max-reconnect-attempts=10",
+            "--reconnect-backoff-factor={}".format(reconnect_delay_ms // 1000),
+            "--hide-histogram",
+        ],
+    }
+    addTLSArgs(benchmark_specs, env)
+    config = get_default_memtier_config(threads=4, clients=1, requests=requests)
+    add_required_env_arguments(benchmark_specs, config, env, env.getMasterNodesList())
+    test_dir = tempfile.mkdtemp()
+    config = RunConfig(test_dir, env.testName, config, {})
+    ensure_clean_benchmark_folder(config.results_dir)
+    benchmark = Benchmark.from_json(config, benchmark_specs)
+    conn = env.getOSSMasterNodesConnectionList()[0]
+    initial_client_ids = {client["id"] for client in conn.client_list()}
+
+    stderr_path = "{0}/mb.stderr".format(config.results_dir)
+    with open("{0}/mb.stdout".format(config.results_dir), "w") as stdout_f, open(stderr_path, "w") as stderr_f:
+        proc = subprocess.Popen(benchmark.args, stdout=stdout_f, stderr=stderr_f, cwd=config.results_dir)
+        try:
+            deadline = time.monotonic() + 10
+            while True:
+                workload = [c for c in conn.client_list()
+                            if c["id"] not in initial_client_ids and c["cmd"] in ("get", "set")]
+                if len(workload) == 4:
+                    break
+                if proc.poll() is not None or time.monotonic() >= deadline:
+                    raise AssertionError("four active workload clients were not ready before the kill "
+                                         "(rc={}, clients={})".format(proc.poll(), workload))
+                time.sleep(0.02)
+            time.sleep(1)
+            killed = conn.execute_command("CLIENT", "KILL", "ID", workload[0]["id"])
+            killed_alive = proc.poll() is None
+            return_code = proc.wait(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=10)
+
+    with open(stderr_path) as f:
+        stderr_content = f.read()
+    with open("{0}/mb.json".format(config.results_dir)) as f:
+        runtime = json.load(f)["ALL STATS"]["Runtime"]
+    env.debugPrint("Runtime: {}".format(runtime), True)
+    diag = "rc={} killed={} memtier alive at kill={} stderr tail:\n{}".format(
+        return_code, killed, killed_alive, stderr_content[-2000:])
+    env.assertEqual(killed, 1, message="CLIENT KILL ID did not kill a workload client; " + diag)
+    env.assertEqual(return_code, 0, message=diag)
+    # CLIENT KILL arrives as EOF ("Connection dropped") or, e.g. as ECONNRESET
+    # or under TLS, as an error ("Connection error"); both log this.
+    env.assertTrue("attempting reconnection" in stderr_content,
+                   message="the killed client did not reconnect; " + diag)
+    duration = runtime["Total duration"]
+    env.assertEqual(duration, runtime["Finish time"] - runtime["Start time"], message=str(runtime))
+    # Mean of three clients at ~3 s and one at ~6 s: ~3.75 s. Allow half the
+    # delayed client's share either side. The last thread alone gives ~3 s
+    # (~6 s if it held the killed client); a weight that overcounts the
+    # first client (e.g. advancing by 2 per client) gives ~4.3 s.
+    expected_ms = requests * 1000 // rate + reconnect_delay_ms // 4
+    margin_ms = reconnect_delay_ms // 8
+    env.assertGreater(duration, expected_ms - margin_ms,
+                      message="Total duration {} ms ignores the delayed client; {}".format(duration, runtime))
+    env.assertLess(duration, expected_ms + margin_ms,
+                   message="Total duration {} ms overweights the delayed client; {}".format(duration, runtime))
