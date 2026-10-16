@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import tempfile
@@ -1297,5 +1298,166 @@ def test_F24_arbitrary_misses_accumulate_across_runs(env):
         env.assertTrue(run2[-1] > run1[-1],
                        message="arbitrary_misses did not accumulate across runs: run1={} run2={}".format(
                            run1[-1], run2[-1]))
+    finally:
+        _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F25 -- memtier_latency_seconds tracks memtier_ops_total (issue #637).
+# The exporter used to read each client's per-second latency histogram at its
+# 1 Hz tick, which lands just after the worker's per-second reset, so _count
+# grew by a few dozen samples per second while ops_total grew by tens of
+# thousands. Every completed second is now exported, so over a multi-second
+# window _count must grow about as fast as ops_total (it lags by at most one
+# second), and never exceed it.
+# ---------------------------------------------------------------------------
+def test_F25_latency_count_tracks_ops(env):
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env, ["--test-time=10", "-t", "2", "-c", "2", "--prometheus-port=0"], rd
+    )
+    samples = []  # (ops_total, latency_seconds_count)
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        deadline = time.time() + 60
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if ops and count is not None:
+                    samples.append((ops, count))
+            time.sleep(0.5)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        for ops, count in samples:
+            env.assertTrue(count <= ops, message="_count {} > ops_total {}".format(count, ops))
+        # Skip the first two seconds (ramp-up), then compare the growth of
+        # both series across the rest of the run (about 7-8 s). _count trails
+        # ops_total by at most about one second of ops at either end, so the
+        # ratio stays near 1 and cannot drop much below 1 - 1/7 ~= 0.86; 0.7
+        # leaves room for a slow CI cell. Before #637 it was 0.0006-0.34.
+        env.assertTrue(len(samples) >= 10, message="too few samples: {}".format(samples))
+        first, last = samples[4], samples[-1]
+        d_ops, d_count = last[0] - first[0], last[1] - first[1]
+        env.assertTrue(d_ops > 0, message="ops_total did not grow: {}".format(samples))
+        env.assertTrue(
+            d_count >= 0.7 * d_ops,
+            message="_count grew {} while ops_total grew {}: {}".format(d_count, d_ops, samples),
+        )
+    finally:
+        _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F26 -- a run's last latency samples are exported before the next run (#637).
+# Each client folds its last partial second at set_end_time(), after which its
+# thread is finished; the exporter must still drain finished threads (at the
+# loop's last tick and at the run-end publish). With --requests the run size
+# is exact, so every scrape taken during run 2 must already count all of run
+# 1's operations. The first render in run 2 lands before run 2's first 1 Hz
+# tick (renders are cached for 1 s), so a missed drain shows there.
+# ---------------------------------------------------------------------------
+def test_F26_run_end_drains_latency(env):
+    if _is_cluster(env):
+        env.skip()  # cluster run boundaries covered by F18
+        return
+    threads, clients, requests = 2, 2, 50000
+    run_ops = threads * clients * requests
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--requests={}".format(requests), "-t", str(threads), "-c", str(clients),
+         "--run-count=2", "--prometheus-port=0"],
+        rd,
+    )
+    run2 = []  # (ops_total, latency_seconds_count) scraped during run 2
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        deadline = time.time() + 120
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                run = prom_sample_value(p, "memtier_run")
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if run == 2 and ops is not None and count is not None:
+                    run2.append((ops, count))
+            time.sleep(0.05)
+        rc = proc.wait()
+        env.assertEqual(rc, 0, message="memtier exit {}: {}".format(rc, _drain(err_path)))
+        env.assertTrue(len(run2) > 0, message="no scrape during run 2")
+        for ops, count in run2:
+            env.assertTrue(ops >= run_ops, message="run 2 ops_total {} < run 1 ops {}".format(ops, run_ops))
+            env.assertTrue(
+                run_ops <= count <= ops,
+                message="run 2 _count {} not in [run 1 ops {}, ops_total {}]: {}".format(
+                    count, run_ops, ops, run2),
+            )
+    finally:
+        _kill(proc)
+
+
+# ---------------------------------------------------------------------------
+# F27 -- the run-end snapshot counts every op after Ctrl+C (#637, PR #665).
+# On Ctrl+C, client_group::interrupt() stamps end times from the main thread
+# while workers may still finish a read callback; the post-join run-end drain
+# must pick those ops up. Ctrl+C does not stop later --run-count runs: run 1
+# ends at once and publishes its run-end snapshot (run 1, 0 threads), then
+# run 2 starts after a 1 s pause and is interrupted at once. Renders are
+# cached for 1 s, so the test stops scraping for over 1 s before the SIGINT;
+# its next scrape then renders inside that gap. On the last run-end scrape,
+# _count must equal memtier_ops_total.
+# ---------------------------------------------------------------------------
+def test_F27_interrupt_run_end_counts_every_op(env):
+    rd = _new_results_dir()
+    proc, out_path, err_path = _popen_memtier(
+        env,
+        ["--test-time=30", "-t", "4", "-c", "10", "--pipeline=16", "--ratio=1:1",
+         "--run-count=2", "--prometheus-port=0"],
+        rd,
+    )
+    run_end = None  # last (ops_total, latency_seconds_count) of run 1's run-end snapshot
+    try:
+        url = wait_for_prometheus_url(out_path, timeout=20)
+        env.assertFalse(url is None, message="no announce line")
+        live = False
+        deadline = time.time() + 30
+        while not live and proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                live = prom_sample_value(p, "memtier_run") == 1 and bool(prom_sample_value(p, "memtier_ops_total"))
+            time.sleep(0.02)
+        env.assertTrue(live, message="no live run-1 scrape: {}".format(_drain(err_path)))
+        time.sleep(1.2)  # let the render cache expire; traffic stays in flight
+        proc.send_signal(signal.SIGINT)
+        deadline = time.time() + 10
+        while "Interrupted by user" not in _drain(err_path) and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)  # threads join and the run-end snapshot is published
+        deadline = time.time() + 60
+        while proc.poll() is None and time.time() < deadline:
+            r = prom_scrape(url, timeout=2)
+            if r.status == 200:
+                p = prom_parse(r.body)
+                run = prom_sample_value(p, "memtier_run")
+                threads = prom_sample_value(p, "memtier_threads")
+                ops = prom_sample_value(p, "memtier_ops_total")
+                count = prom_sample_value(p, "memtier_latency_seconds_count")
+                if run == 1 and threads == 0 and ops is not None and count is not None:
+                    run_end = (ops, count)
+            time.sleep(0.02)
+        proc.wait(timeout=30)
+        if run_end is None:
+            env.skip()  # no render landed between the runs (slow runner)
+            return
+        ops, count = run_end
+        env.assertTrue(ops > 0, message="run 1 completed no ops")
+        env.assertEqual(count, ops, message="run-end _count {} != ops_total {}".format(count, ops))
     finally:
         _kill(proc)
