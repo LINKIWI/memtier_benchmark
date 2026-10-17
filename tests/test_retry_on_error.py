@@ -1066,9 +1066,13 @@ _TXN_KILL_THREADS, _TXN_KILL_CLIENTS = 2, 4
 
 
 def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, kill_interval=0.5, pipeline=1,
-                                set_ratio=1):
-    """Run a MULTI/SET/EXEC --transaction rotation while every primary's
-    clients are killed every kill_interval seconds.
+                                set_ratio=1, max_waves=None, until_dropped=False):
+    """Run a MULTI/SET/EXEC --transaction rotation while memtier's clients on
+    every primary are killed every kill_interval seconds, at most max_waves
+    times. Each wave waits until memtier has sent a MULTI since the last one,
+    so no wave lands while every connection is still reconnecting. With
+    until_dropped, the waves stop once a kill has dropped an in-flight
+    request (a transaction-not-replayed row in --failed-keys-file).
 
     Returns (rc, stderr, connections killed, server -ERR replies, failed-keys rows).
     """
@@ -1101,17 +1105,51 @@ def _run_transaction_with_kills(env, extra_args, requests=None, test_time=None, 
     for conn in conns:
         conn.execute_command("CONFIG", "RESETSTAT")
 
+    # Kill and count only memtier's clients, not the harness's own.
+    harness = harness_client_ids(conns)
     kills = []
+
+    poll_errors = []
+
+    def multi_calls():
+        try:
+            return sum(conn.execute_command("INFO", "commandstats").get("cmdstat_multi", {}).get("calls", 0)
+                       for conn in conns)
+        except Exception as e:
+            # Polled every 1ms: log the first failure only.
+            if not poll_errors:
+                env.debugPrint("INFO commandstats failed: {}".format(e), True)
+            poll_errors.append(e)
+            return -1
+
+    def dropped():
+        try:
+            with open(failed_keys) as f:
+                return any(r.endswith(',"transaction-not-replayed",0') for r in f.read().splitlines())
+        except OSError:
+            return False
 
     def kill_loop(proc):
         end = time.time() + (test_time - 1 if test_time else 60)
-        while time.time() < end and proc.poll() is None:
+        last = 0
+        while time.time() < end and proc.poll() is None and (max_waves is None or len(kills) < max_waves):
+            # memtier logs a dropped request once it handles the kill, so look
+            # for it after kill_interval, not right after the kill.
+            if until_dropped and dropped():
+                break
+            # Each wave goes in as soon as memtier has sent a MULTI since the
+            # last one. The first one is not one kill_interval in: a fast
+            # runner can finish a --requests run within kill_interval, and
+            # nothing is killed (#682).
+            calls = multi_calls()
+            while calls <= last and time.time() < end and proc.poll() is None:
+                time.sleep(0.001)
+                calls = multi_calls()
+            if calls <= last:
+                break
+            last = calls
+            kills.append(kill_memtier_clients(env, conns, harness))
             time.sleep(kill_interval)
-            for conn in conns:
-                try:
-                    kills.append(conn.execute_command("CLIENT", "KILL", "TYPE", "normal"))
-                except Exception as e:
-                    env.debugPrint("CLIENT KILL failed: {}".format(e), True)
 
     rc, stderr_content = _run_with_background(env, benchmark, config, kill_loop, timeout=(test_time or 60) + 30)
 
@@ -1162,8 +1200,15 @@ def test_dropped_transaction_requests_do_not_stall_requests_run(env):
     Transaction requests dropped on a kill are uncounted, so a --requests run
     still sends every request and ends.
     """
-    rc, stderr_content, _, _, _ = _run_transaction_with_kills(env, ["--retry-on-error"], requests=30000,
-                                                              kill_interval=0.3, pipeline=4)
+    # The kills stop once one has dropped in-flight requests (or after
+    # max_waves), and memtier must then complete the run. Without a stop, a
+    # cluster run is killed for the helper's whole 60s window.
+    rc, stderr_content, _, _, rows = _run_transaction_with_kills(env, ["--retry-on-error"], requests=30000,
+                                                                 kill_interval=0.3, pipeline=4, max_waves=50,
+                                                                 until_dropped=True)
+    # The scenario needs a kill that dropped in-flight transaction requests.
+    dropped = [r for r in rows if r.endswith(',"transaction-not-replayed",0')]
+    env.assertGreaterEqual(len(dropped), 1, message="no in-flight transaction request was dropped on a kill")
     env.assertFalse("stopped before reaching" in stderr_content,
                     message="client stopped sending after dropping transaction requests")
     env.assertEqual(rc, 0, message="memtier exited {} after connection kills".format(rc))
