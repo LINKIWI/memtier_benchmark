@@ -470,6 +470,16 @@ running against a Redis Cluster with replicas.  Four modes are available:
   until warm, then reads are routed to the lowest-EWMA endpoint among
   warm replicas (primary may participate once it has accumulated samples).
 
+Replica setup rejection (AUTH, SELECT or HELLO) has a separate policy from
+routing around an unavailable node. Under `primary`, a rejected replica is
+closed and left closed because it is not needed. With `--reconnect-on-error`,
+`secondaryPreferred` also closes such a replica without redialing it or
+failing the run; reads can fall back to the primary. Without that flag,
+`secondaryPreferred` keeps the existing setup-failure handling. `secondary`
+and `nearest` do not use this optional-replica exception: although routing
+may allow a primary fallback, an unrecovered setup rejection can still fail
+the run. Ordinary connection losses continue to follow the reconnect policy.
+
 When the target node class is unavailable, the fallback is controlled by
 `--read-preference-fallback`:
 
@@ -522,6 +532,51 @@ nearest) route reads correctly to replicas, with zero leakage to primaries.
 
 A follow-up fixture that bootstraps a real `redis-cli --cluster create`
 cluster within the test harness is tracked in issue #462 (filed by this PR).
+
+### Reconnecting after connection errors
+
+With `--reconnect-on-error`, a lost connection is reconnected with a delay
+(`--reconnect-backoff-factor`) instead of ending its thread.
+`--max-reconnect-attempts` bounds the consecutive failed attempts; when they
+are exhausted, the thread ends and the run fails (exit code 1), whether or not
+the `--test-time` deadline has passed. Every failed reconnect counts as a
+connection error in the report, over TCP and over a unix socket alike. With
+the default of 0 (unlimited), a server that stays down is retried until the
+run's stop condition:
+
+- `--test-time`: once the deadline has passed, memtier stops reconnecting and
+  ends the run normally with its report. A pending reconnect is due no later
+  than the deadline, whatever the backoff delay, and the report's duration and
+  throughput cover `--test-time`, not the time spent waiting for a failed
+  reconnect.
+  - A required connection whose setup step (AUTH, SELECT, HELLO) was rejected
+    since its last reply fails the run instead (exit code 1), as when setup
+    keeps failing at the deadline. The optional-replica exceptions are
+    described under Read Preference above.
+  - A connection that a live server drops around the deadline is still
+    reconnected once, so requests held for replay are resent; if that
+    reconnect fails or is dropped again, the run ends. So a peer that accepts
+    connections and closes them after a delay can extend the run by up to
+    about twice that delay past `--test-time`.
+  - In cluster mode this holds for the main connection only: another shard's
+    connection is reconnected through a slot map refresh. Once the run is
+    over, a refresh still redials it; if that dial fails, the connection is
+    left closed and the requests it held count as errors.
+  - A client that never got a reply before the server went away did no work:
+    it stops at the deadline too, but fails the run (exit code 1), even if
+    other clients on its thread completed requests. This includes a client
+    prevented from starting by repeated TLS-handshake failures. One whose
+    first connection only completes after the deadline (e.g. a server killing
+    connections before their first reply) is timed from the start of the run,
+    so it ends at its first reply instead of running a whole `--test-time`.
+  - The deadline is measured from the start of the run, so it does not cover
+    a server that is gone before any connection got a reply: that startup
+    phase is bounded by `--connection-stage-timeout` (default 30 s), which
+    fails the run with exit code 2.
+- `--requests`: with unlimited attempts (the default of 0), the run waits for
+  the server indefinitely, since the requests can only complete once it is
+  back. memtier warns once, after 10 failed attempts, that the server is still
+  unreachable; set `--max-reconnect-attempts` to give up instead.
 
 ### Using rate-limiting for informed benchmarking
 

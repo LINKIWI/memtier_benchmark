@@ -165,6 +165,7 @@ client::client(client_group *group) :
         m_event_base(NULL),
         m_initialized(false),
         m_end_set(false),
+        m_run_failed(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(group->get_config()),
@@ -203,6 +204,7 @@ client::client(struct event_base *event_base, benchmark_config *config, abstract
         m_event_base(NULL),
         m_initialized(false),
         m_end_set(false),
+        m_run_failed(false),
         m_config(NULL),
         m_obj_gen(NULL),
         m_stats(config),
@@ -389,8 +391,7 @@ void client::set_end_time()
     if (!m_end_set) {
         benchmark_debug_log("nothing else to do, test is finished.\n");
 
-        m_stats.set_end_time(NULL);
-        m_end_set = true;
+        set_end_time_at(NULL);
     }
 }
 
@@ -438,11 +439,28 @@ bool client::abandon_unanswered_requests(unsigned long long *unanswered, unsigne
     // The run measured --test-time, not the grace period spent waiting.
     struct timeval end_time = m_stats.get_start_time();
     end_time.tv_sec += m_config->test_time;
-    m_stats.set_end_time(&end_time);
-    m_end_set = true;
+    set_end_time_at(&end_time);
     // The caller reports the requests held for retry with the others.
     *held += disconnect_and_abandon_held();
     return true;
+}
+
+void client::set_end_time_at(struct timeval *end_time)
+{
+    if (!m_end_set) {
+        m_stats.set_end_time(end_time);
+        m_end_set = true;
+        // A connection whose setup the server rejected since its last reply
+        // (a required replica, say) and that never recovered fails the run
+        // (#630), also when another connection ends the client first. Apply
+        // this at a normal end and when a failed connect or drain-grace expiry
+        // caps the stats at the deadline: which connection ends first is only
+        // timing.
+        for (unsigned int i = 0; i < m_connections.size(); i++) {
+            shard_connection *sc = m_connections[i];
+            if (sc != NULL && sc->stops_at_deadline() && sc->setup_failed_since_reply()) m_run_failed = true;
+        }
+    }
 }
 
 bool client::hold_pipeline(unsigned int conn_id)
@@ -1680,14 +1698,27 @@ void client_group::finalize_all_clients(struct timeval *end_time)
 }
 
 // Connected (prepare()-d) clients that have not reached their stop condition
-// when the event loop returns. The missing end time establishes incomplete work,
+// when the event loop returns (those marked failed are counted by
+// count_failed_clients()). The missing end time establishes incomplete work,
 // not its cause. Clients a staircase ramp never connected are not counted.
 unsigned int client_group::count_unended_clients(void)
 {
     unsigned int count = 0;
     unsigned int active = active_client_count();
     for (unsigned int i = 0; i < active && i < m_clients.size(); i++) {
-        if (!m_clients[i]->end_time_set()) count++;
+        if (!m_clients[i]->end_time_set() && !m_clients[i]->run_failed()) count++;
+    }
+    return count;
+}
+
+// Connected clients that a connection marked failed after the run was over
+// (client::fail_run(), e.g. a setup rejected since the last reply).
+unsigned int client_group::count_failed_clients(void)
+{
+    unsigned int count = 0;
+    unsigned int active = active_client_count();
+    for (unsigned int i = 0; i < active && i < m_clients.size(); i++) {
+        if (m_clients[i]->run_failed()) count++;
     }
     return count;
 }
