@@ -225,6 +225,16 @@ static bool g_worker_failed = false;
 // error has been printed; main() then exits 1.
 static bool g_output_failed = false;
 
+// main owns the JSON writer. Workers never write JSON, and main writes results
+// after joining them, so the exit callback sees a quiescent writer. Close only
+// content already emitted, including benchmark results if verification exits.
+static json_handler *g_json_out_file = NULL;
+
+static void close_json_out_file_at_exit(void)
+{
+    if (g_json_out_file != NULL) g_json_out_file->close();
+}
+
 // Forward declarations
 struct cg_thread;
 static void print_client_list(FILE *fp, int pid, const char *timestr);
@@ -5858,6 +5868,12 @@ int main(int argc, char *argv[])
         jsonhandler = new json_handler((const char *) cfg.json_out_file);
         // We always print the configuration to the JSON file
         config_print_to_json(jsonhandler, &cfg);
+        if (atexit(close_json_out_file_at_exit) != 0) {
+            fprintf(stderr, "error: cannot register JSON output cleanup.\n");
+            delete jsonhandler;
+            exit(1);
+        }
+        g_json_out_file = jsonhandler;
     }
 
     if (cfg.out_file != NULL) {
@@ -5869,8 +5885,7 @@ int main(int argc, char *argv[])
         struct stat st;
         if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
             fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
-            // Close the JSON nesting, so the --json-out-file stays valid.
-            delete jsonhandler;
+            // The exit handler finishes the JSON nesting.
             exit(1);
         }
     } else {
@@ -6107,6 +6122,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "error: failed writing --json-out-file %s: %s\n", cfg.json_out_file, strerror(json_err));
             g_output_failed = true;
         }
+        g_json_out_file = NULL;
         delete jsonhandler;
     }
 
