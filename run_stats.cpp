@@ -130,6 +130,7 @@ run_stats::run_stats(benchmark_config *config) :
         m_config(config),
         m_interrupted(false),
         m_unanswered_requests(0),
+        m_averaged_runs(0),
         m_totals(),
         m_cur_stats(0),
         m_cluster_endpoints(0),
@@ -1057,6 +1058,8 @@ bool one_second_stats_predicate(const one_second_stats &a, const one_second_stat
 void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
 {
     unsigned long long total_duration_usec = 0;
+    bool have_start = false;
+    struct timeval first_start = {};
 
     for (std::vector<run_stats>::const_iterator i = all_stats.begin(); i != all_stats.end(); i++) {
         totals i_totals;
@@ -1108,7 +1111,14 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
             }
         }
 
-        total_duration_usec += ts_diff(i->m_start_time, i->m_end_time);
+        // A run that never started has no times. It still counts as one of
+        // the runs, with a zero duration, like its zero Ops/sec does.
+        if (i->has_started()) {
+            const long long run_usec = ts_diff(i->m_start_time, i->m_end_time);
+            if (run_usec > 0) total_duration_usec += run_usec;
+            if (!have_start || timercmp(&i->m_start_time, &first_start, <)) first_start = i->m_start_time;
+            have_start = true;
+        }
 
         // Like merge(): the average is interrupted if any of its runs was.
         if (i->get_interrupted()) set_interrupted(true);
@@ -1130,20 +1140,28 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
     m_totals.m_connection_errors_sec /= all_stats.size();
     m_totals.m_latency /= all_stats.size();
 
-    // m_arbitrary_misses now holds the SUMMED hit/miss counts across all runs,
-    // and the synthetic duration below is the SUMMED run duration. The rate the
-    // print paths compute, count / ts_diff(m_start_time, m_end_time), is then the
-    // exact time-weighted average Σhits / Σduration — mathematically equal to
-    // dividing both the count and the duration by N, but without the integer
-    // truncation that dividing the unsigned counts by N would introduce (which
-    // could otherwise zero out small miss counts and suppress the miss-rate
-    // warning). Counts are left summed deliberately: the JSON "Per-Key Misses"
-    // section reports cumulative Total Hits/Misses across the runs.
-    if (!all_stats.empty() && total_duration_usec > 0) {
-        m_start_time.tv_sec = 0;
-        m_start_time.tv_usec = 0;
-        m_end_time.tv_sec = (time_t) (total_duration_usec / 1000000);
-        m_end_time.tv_usec = (suseconds_t) (total_duration_usec % 1000000);
+    // Every value in the AVERAGE section is a per-run value (#703). The counts
+    // (ops, accumulated latency, connection errors, unanswered requests, hits
+    // and misses) stay summed here, and so does the duration set below.
+    // Dividing a summed count by the summed duration, count /
+    // ts_diff(m_start_time, m_end_time), gives the exact time-weighted rate
+    // Σcount / Σduration, without truncating small counts. print_json()
+    // writes each count as its per-run mean, an integer (mean_count()), and
+    // the Totals counts as the sum of the rows.
+    m_averaged_runs = all_stats.size();
+
+    // Start at the first run's start, and span the summed run duration; the
+    // JSON Runtime prints the mean duration from it (print_json()).
+    // Warning: m_end_time is then a synthetic end time (first start + summed
+    // duration) that no run had; it is only meant for ts_diff() and the
+    // Runtime print.
+    if (have_start && total_duration_usec > 0) {
+        const unsigned long long start_usec =
+            (unsigned long long) first_start.tv_sec * 1000000 + (unsigned long long) first_start.tv_usec;
+        const unsigned long long end_usec = start_usec + total_duration_usec;
+        m_start_time = first_start;
+        m_end_time.tv_sec = (time_t) (end_usec / 1000000);
+        m_end_time.tv_usec = (suseconds_t) (end_usec % 1000000);
     }
 
     // Combine the whole-process CPU aggregate across runs: sum CPU-seconds and
@@ -1176,6 +1194,13 @@ void run_stats::aggregate_average(const std::vector<run_stats> &all_stats)
             max_threads_counted > 0
                 ? 100.0 * (agg_cpu.worker_total_seconds / agg_cpu.wall_seconds) / max_threads_counted
                 : 0.0;
+        // Report the CPU and wall seconds per run, like the other counts;
+        // the ratios above are unchanged by it.
+        agg_cpu.user_seconds /= cpu_runs;
+        agg_cpu.sys_seconds /= cpu_runs;
+        agg_cpu.total_seconds /= cpu_runs;
+        agg_cpu.worker_total_seconds /= cpu_runs;
+        agg_cpu.wall_seconds /= cpu_runs;
         agg_cpu.valid = true;
         m_cpu_summary = agg_cpu;
     }
@@ -1417,6 +1442,18 @@ static void format_percentile_key(char *buf, size_t bufsize, double quantile, co
     if (percentile_key_is_exact(buf, quantile)) return;
 
     snprintf(buf, bufsize, "p%.17g", quantile);
+}
+
+// A count summed over the runs of an AVERAGE section, as the per-run mean
+// rounded to the nearest integer, so the JSON keeps the integer type of a
+// run's section. A non-zero sum never rounds to 0, so a single error or miss
+// stays visible next to its non-zero rate. runs == 0 (a real run) keeps the
+// count.
+static unsigned long long mean_count(unsigned long long sum, size_t runs)
+{
+    if (runs == 0) return sum;
+    const unsigned long long mean = (sum + runs / 2) / runs;
+    return (sum > 0 && mean == 0) ? 1 : mean;
 }
 
 void result_print_to_json(json_handler *jsonhandler, const char *type, double ops_sec, double hits, double miss,
@@ -2031,14 +2068,20 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 {
     if (jsonhandler != NULL) { // Added for double verification in case someone accidently send NULL.
         jsonhandler->open_nesting("Runtime");
-        const long long start_time_ms = ((long long) m_start_time.tv_sec * 1000000 + m_start_time.tv_usec) / 1000;
-        const long long end_time_ms = ((long long) m_end_time.tv_sec * 1000000 + m_end_time.tv_usec) / 1000;
+        const long long start_usec = (long long) m_start_time.tv_sec * 1000000 + m_start_time.tv_usec;
+        const long long start_time_ms = start_usec / 1000;
+        // For an AVERAGE, the start is the first run's start and the duration
+        // the mean run duration.
+        const long long end_usec = m_averaged_runs > 0
+                                       ? start_usec + ts_diff(m_start_time, m_end_time) / (long long) m_averaged_runs
+                                       : (long long) m_end_time.tv_sec * 1000000 + m_end_time.tv_usec;
+        const long long end_time_ms = end_usec / 1000;
         jsonhandler->write_obj("Start time", "%lld", start_time_ms);
         jsonhandler->write_obj("Finish time", "%lld", end_time_ms);
         jsonhandler->write_obj("Total duration", "%lld", end_time_ms - start_time_ms);
         jsonhandler->write_obj("Time unit", "\"%s\"", "MILLISECONDS");
         jsonhandler->write_obj("Interrupted", "\"%s\"", get_interrupted() ? "true" : "false");
-        jsonhandler->write_obj("Unanswered requests", "%llu", m_unanswered_requests);
+        jsonhandler->write_obj("Unanswered requests", "%llu", mean_count(m_unanswered_requests, m_averaged_runs));
         jsonhandler->close_nesting();
     }
 
@@ -2077,6 +2120,26 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
 
     std::vector<unsigned int> timestamps = get_one_sec_cmd_stats_timestamp();
 
+    // In an AVERAGE section (m_averaged_runs > 0) each row prints the rounded
+    // per-run mean of its summed Count and Accumulated Latency (ms), and Totals
+    // prints the sum of the rows, so Totals stays exactly the sum of its rows.
+    // A real run prints its counts unchanged.
+    unsigned long long rows_ops = 0;
+    unsigned long long rows_latency_ms = 0;
+    auto row_ops = [&](unsigned long long ops) {
+        const unsigned long long mean = mean_count(ops, m_averaged_runs);
+        rows_ops += mean;
+        return (long long) mean;
+    };
+    // Returns the latency in the units result_print_to_json() expects (it
+    // divides by LATENCY_HDR_RESULTS_MULTIPLIER to print ms).
+    auto row_latency = [&](unsigned long long total_latency) {
+        if (m_averaged_runs == 0) return (long long) total_latency;
+        const unsigned long long ms = mean_count(total_latency / LATENCY_HDR_RESULTS_MULTIPLIER, m_averaged_runs);
+        rows_latency_ms += ms;
+        return (long long) (ms * LATENCY_HDR_RESULTS_MULTIPLIER);
+    };
+
     if (print_arbitrary_commands_results()) {
         unsigned long long int test_duration_usec = ts_diff(m_start_time, m_end_time);
         if (aggregated != nullptr) {
@@ -2106,7 +2169,7 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 result_print_to_json(jsonhandler, command_name.c_str(), agg.stats.m_ops_sec, hits_sec, misses_sec,
                                      cluster_mode ? agg.stats.m_moved_sec : -1, cluster_mode ? agg.stats.m_ask_sec : -1,
                                      agg.stats.m_bytes_sec, agg.stats.m_bytes_sec_rx, agg.stats.m_bytes_sec_tx,
-                                     avg_latency, agg.stats.m_total_latency, agg.stats.m_ops,
+                                     avg_latency, row_latency(agg.stats.m_total_latency), row_ops(agg.stats.m_ops),
                                      0.0, // connection_errors_sec (not tracked per command)
                                      0,   // connection_errors (not tracked per command)
                                      quantiles_list, agg.latency_hist, timestamps, agg.per_second_stats,
@@ -2133,8 +2196,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                     cluster_mode ? m_totals.m_ar_commands[i].m_moved_sec : -1,
                     cluster_mode ? m_totals.m_ar_commands[i].m_ask_sec : -1, m_totals.m_ar_commands[i].m_bytes_sec,
                     m_totals.m_ar_commands[i].m_bytes_sec_rx, m_totals.m_ar_commands[i].m_bytes_sec_tx,
-                    m_totals.m_ar_commands[i].m_latency, m_totals.m_ar_commands[i].m_total_latency,
-                    m_totals.m_ar_commands[i].m_ops,
+                    m_totals.m_ar_commands[i].m_latency, row_latency(m_totals.m_ar_commands[i].m_total_latency),
+                    row_ops(m_totals.m_ar_commands[i].m_ops),
                     0.0, // connection_errors_sec (not tracked per command)
                     0,   // connection_errors (not tracked per command)
                     quantiles_list, arbitrary_command_latency_histogram, timestamps, arbitrary_command_stats,
@@ -2162,14 +2225,30 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                 if (t.per_key_hits.empty()) continue;
                 if (i >= command_list.size()) continue;
                 jsonhandler->open_nesting(keys[i].c_str());
-                jsonhandler->write_obj("Total Hits", "%llu", t.total_hits);
-                jsonhandler->write_obj("Total Misses", "%llu", t.total_misses);
+                // In an AVERAGE, when the totals are the sum of the per-key
+                // buckets, keep them so: sum the rounded buckets, like Totals
+                // and its rows.
+                unsigned long long total_hits = mean_count(t.total_hits, m_averaged_runs);
+                unsigned long long total_misses = mean_count(t.total_misses, m_averaged_runs);
+                if (m_averaged_runs > 0) {
+                    unsigned long long key_hits = 0, key_misses = 0, mean_hits = 0, mean_misses = 0;
+                    for (size_t k = 0; k < t.per_key_hits.size(); ++k) {
+                        key_hits += t.per_key_hits[k];
+                        key_misses += t.per_key_misses[k];
+                        mean_hits += mean_count(t.per_key_hits[k], m_averaged_runs);
+                        mean_misses += mean_count(t.per_key_misses[k], m_averaged_runs);
+                    }
+                    if (key_hits == t.total_hits) total_hits = mean_hits;
+                    if (key_misses == t.total_misses) total_misses = mean_misses;
+                }
+                jsonhandler->write_obj("Total Hits", "%llu", total_hits);
+                jsonhandler->write_obj("Total Misses", "%llu", total_misses);
                 for (size_t k = 0; k < t.per_key_hits.size(); ++k) {
                     char label[32];
                     snprintf(label, sizeof(label), "key[%zu] Hits", k);
-                    jsonhandler->write_obj(label, "%llu", t.per_key_hits[k]);
+                    jsonhandler->write_obj(label, "%llu", mean_count(t.per_key_hits[k], m_averaged_runs));
                     snprintf(label, sizeof(label), "key[%zu] Misses", k);
-                    jsonhandler->write_obj(label, "%llu", t.per_key_misses[k]);
+                    jsonhandler->write_obj(label, "%llu", mean_count(t.per_key_misses[k], m_averaged_runs));
                 }
                 jsonhandler->close_nesting();
             }
@@ -2183,7 +2262,8 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                              cluster_mode ? m_totals.m_set_cmd.m_moved_sec : -1,
                              cluster_mode ? m_totals.m_set_cmd.m_ask_sec : -1, m_totals.m_set_cmd.m_bytes_sec,
                              m_totals.m_set_cmd.m_bytes_sec_rx, m_totals.m_set_cmd.m_bytes_sec_tx,
-                             m_totals.m_set_cmd.m_latency, m_totals.m_set_cmd.m_total_latency, m_totals.m_set_cmd.m_ops,
+                             m_totals.m_set_cmd.m_latency, row_latency(m_totals.m_set_cmd.m_total_latency),
+                             row_ops(m_totals.m_set_cmd.m_ops),
                              0.0, // connection_errors_sec (not tracked per command)
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_set_latency_histogram, timestamps, set_stats);
@@ -2191,12 +2271,14 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
                              m_totals.m_misses_sec, cluster_mode ? m_totals.m_get_cmd.m_moved_sec : -1,
                              cluster_mode ? m_totals.m_get_cmd.m_ask_sec : -1, m_totals.m_get_cmd.m_bytes_sec,
                              m_totals.m_get_cmd.m_bytes_sec_rx, m_totals.m_get_cmd.m_bytes_sec_tx,
-                             m_totals.m_get_cmd.m_latency, m_totals.m_get_cmd.m_total_latency, m_totals.m_get_cmd.m_ops,
+                             m_totals.m_get_cmd.m_latency, row_latency(m_totals.m_get_cmd.m_total_latency),
+                             row_ops(m_totals.m_get_cmd.m_ops),
                              0.0, // connection_errors_sec (not tracked per command)
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_get_latency_histogram, timestamps, get_stats);
         result_print_to_json(jsonhandler, "Waits", m_totals.m_wait_cmd.m_ops_sec, 0.0, 0.0, cluster_mode ? 0.0 : -1,
-                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, 0.0, 0.0, m_totals.m_wait_cmd.m_ops,
+                             cluster_mode ? 0.0 : -1, 0.0, 0.0, 0.0, 0.0, row_latency(0),
+                             row_ops(m_totals.m_wait_cmd.m_ops),
                              0.0, // connection_errors_sec (not tracked per command)
                              0,   // connection_errors (not tracked per command)
                              quantiles_list, m_wait_latency_histogram, timestamps, wait_stats);
@@ -2233,9 +2315,12 @@ void run_stats::print_json(json_handler *jsonhandler, arbitrary_command_list &co
     result_print_to_json(jsonhandler, "Totals", m_totals.m_ops_sec, totals_hits_sec, totals_misses_sec,
                          cluster_mode ? m_totals.m_moved_sec : -1, cluster_mode ? m_totals.m_ask_sec : -1,
                          m_totals.m_bytes_sec, m_totals.m_bytes_sec_rx, m_totals.m_bytes_sec_tx, m_totals.m_latency,
-                         m_totals.m_total_latency, m_totals.m_ops, m_totals.m_connection_errors_sec,
-                         m_totals.m_connection_errors, quantiles_list, m_totals.latency_histogram, timestamps,
-                         total_stats, totals_aborts_sec);
+                         m_averaged_runs > 0 ? (long long) (rows_latency_ms * LATENCY_HDR_RESULTS_MULTIPLIER)
+                                             : (long long) m_totals.m_total_latency,
+                         m_averaged_runs > 0 ? (long long) rows_ops : (long long) m_totals.m_ops,
+                         m_totals.m_connection_errors_sec,
+                         (long long) mean_count(m_totals.m_connection_errors, m_averaged_runs), quantiles_list,
+                         m_totals.latency_histogram, timestamps, total_stats, totals_aborts_sec);
 
     // -----------------------------------------------------------------
     // Read-preference observability (Step 2f).

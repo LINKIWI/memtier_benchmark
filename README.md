@@ -250,6 +250,39 @@ for retry are not resent, are counted as errors and written to
 test time ended`. They are not part of `"Unanswered requests"`, which only
 counts requests that were waiting for a reply.
 
+### Repeated runs (`--run-count`)
+
+With `--run-count N`, memtier reports the best and the worst run (by
+Ops/sec), and an `AGGREGATED AVERAGE RESULTS (N runs)` section with per-run
+values:
+
+- The counts (`Count`, `Accumulated Latency`, `Connection Errors`,
+  `Unanswered requests` and the `Per-Key Misses` counts) are the mean over
+  the runs, rounded to the nearest integer, so they keep the integer type of
+  the other sections (29659 ops over 3 runs give `"Count": 9886`). A count
+  that is not 0 over the series never rounds to 0: 1 connection error over 3
+  runs gives 1, not 0, next to its non-zero rate. The `Totals` `Count` and
+  `Accumulated Latency` are the sum of the rounded command rows, so `Totals`
+  is exactly the sum of its rows; it can differ from the mean of the per-run
+  `Totals` by about one unit per row. In the same way, the `Per-Key Misses`
+  `Total Hits` / `Total Misses` are the sum of the rounded `key[i]` values.
+- Ops/sec, KB/sec, the default workload's Hits/sec and Misses/sec, and the
+  JSON `Latency` / `Average Latency` are the mean of the per-run values. The
+  Hits/sec and Misses/sec of `--command` rows are time-weighted instead: the
+  hits (or misses) of all runs divided by the duration of all runs.
+- Percentiles come from the latency histograms of all the runs merged
+  together, so the section's `Histogram log format` holds the samples of all
+  the runs (N times its `Count`).
+- `Runtime` `Total duration` is the mean run duration, `Start time` is the
+  start of the first run, and `Finish time` is `Start time` plus
+  `Total duration`.
+- The `CPU` seconds are the mean over the runs that reported CPU usage (all
+  of them on Linux).
+
+The section name always shows `--run-count`, so the JSON key does not
+change. If the series is cut short (see below), the means are over the runs
+that happened, `"Runs completed"` in the JSON `run information` section.
+
 ### Interrupting a run
 
 Ctrl+C (SIGINT) and SIGTERM (sent by `kill`, `timeout`, `docker stop`,

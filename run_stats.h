@@ -173,6 +173,11 @@ protected:
     // Workload requests abandoned because no reply came within
     // TEST_TIME_DRAIN_GRACE_SECS after --test-time ended.
     unsigned long long int m_unanswered_requests;
+    // Number of runs aggregate_average() averaged into this object; 0 for a
+    // real run. m_start_time / m_end_time then span the SUMMED duration of
+    // the runs, and the counts stay summed (see aggregate_average()), so
+    // print_json() divides them by it when it writes them.
+    size_t m_averaged_runs;
 
     totals m_totals;
 
