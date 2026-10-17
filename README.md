@@ -1,5 +1,5 @@
 memtier_benchmark
-==========
+=================
 ![GitHub](https://img.shields.io/github/license/redis/memtier_benchmark)
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/redis/memtier_benchmark)](https://github.com/redis/memtier_benchmark/releases)
 [![codecov](https://codecov.io/gh/redis/memtier_benchmark/branch/master/graph/badge.svg)](https://codecov.io/gh/redis/memtier_benchmark)
