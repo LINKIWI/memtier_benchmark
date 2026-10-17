@@ -128,6 +128,11 @@ void cluster_slots_retry_cb(evutil_socket_t, short, void *ctx)
     static_cast<shard_connection *>(ctx)->handle_cluster_slots_retry_event();
 }
 
+void setup_rejected_check_cb(evutil_socket_t, short, void *ctx)
+{
+    static_cast<shard_connection *>(ctx)->handle_setup_rejected_check_event();
+}
+
 void cluster_client_connection_timeout_handler(evutil_socket_t fd, short what, void *ctx)
 {
     shard_connection *sc = (shard_connection *) ctx;
@@ -293,6 +298,8 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_reconnect_timer(NULL),
         m_reconnecting(false),
         m_setup_rejected(false),
+        m_setup_rejected_replica(false),
+        m_setup_rejected_context(NULL),
         m_thread_end_reason(NULL),
         m_connection_timeout_timer(NULL),
         m_retry_queue(NULL),
@@ -300,6 +307,7 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         m_retry_drain_timer(NULL),
         m_deferred_fill_timer(NULL),
         m_cluster_slots_retry_timer(NULL),
+        m_setup_rejected_timer(NULL),
         m_bev_paused(false)
 {
     m_id = id;
@@ -401,6 +409,11 @@ shard_connection::~shard_connection()
     if (m_cluster_slots_retry_timer != NULL) {
         event_free(m_cluster_slots_retry_timer);
         m_cluster_slots_retry_timer = NULL;
+    }
+
+    if (m_setup_rejected_timer != NULL) {
+        event_free(m_setup_rejected_timer);
+        m_setup_rejected_timer = NULL;
     }
 
     if (m_retry_queue != NULL) {
@@ -691,6 +704,10 @@ void shard_connection::disconnect()
     if (m_cluster_slots_retry_timer != NULL && evtimer_pending(m_cluster_slots_retry_timer, NULL)) {
         evtimer_del(m_cluster_slots_retry_timer);
     }
+    if (m_setup_rejected_timer != NULL && evtimer_pending(m_setup_rejected_timer, NULL)) {
+        evtimer_del(m_setup_rejected_timer);
+    }
+    m_setup_rejected_context = NULL;
 
     m_connection_state = conn_disconnected;
     m_disconnect_count++;
@@ -1495,15 +1512,11 @@ void shard_connection::process_response(void)
                 if (m_config->reconnect_on_error) {
                     attempt_reconnect("READONLY error");
                 } else {
-                    // Mirror attempt_reconnect's stat bump so the OFF path
+                    // Count it, as attempt_reconnect does, so the OFF path
                     // is observable: without this, --reconnect-on-error=off
                     // READONLY errors would silently idle the replica with
                     // no signal in the connection-error counter.
-                    struct timeval err_now;
-                    gettimeofday(&err_now, NULL);
-                    client *c = static_cast<client *>(m_conns_manager);
-                    c->get_stats()->update_connection_error(&err_now);
-                    disconnect();
+                    disconnect_after_error();
                 }
                 // Wake peer connections (the primary may be parked in the
                 // "no live replica yet" gate); mirror the success arm so a
@@ -1900,13 +1913,36 @@ void shard_connection::schedule_fill(void)
     }
 }
 
-void shard_connection::attempt_reconnect(const char *error_context)
+void shard_connection::count_connection_error()
 {
-    // Update connection error statistics
     struct timeval now;
     gettimeofday(&now, NULL);
-    client *c = static_cast<client *>(m_conns_manager);
-    c->get_stats()->update_connection_error(&now);
+    static_cast<client *>(m_conns_manager)->get_stats()->update_connection_error(&now);
+}
+
+// Count a connection error and disconnect, without reconnecting.
+void shard_connection::disconnect_after_error()
+{
+    count_connection_error();
+    disconnect();
+}
+
+// Disconnect and end this thread: run_benchmark() then fails the run. It is
+// not restarted.
+void shard_connection::end_thread(const char *reason, const char *thread_end_reason)
+{
+    benchmark_error_log("%s, ending this thread.\n", reason);
+    disconnect();
+    // Nothing will resend the requests held for it now: client_group::run()
+    // abandons them, and those of the other connections on this thread,
+    // once the loop returns.
+    set_thread_end_reason(thread_end_reason);
+    event_base_loopbreak(m_event_base);
+}
+
+void shard_connection::attempt_reconnect(const char *error_context)
+{
+    count_connection_error();
 
     // Attempt reconnection if enabled and not already reconnecting
     if (m_config->reconnect_on_error && !m_reconnecting &&
@@ -1989,16 +2025,8 @@ void shard_connection::attempt_reconnect(const char *error_context)
             disconnect();
             return;
         }
-        benchmark_error_log("%s, ending this thread.\n", reason);
-        disconnect();
-        // Nothing will resend the requests held for it now: client_group::run()
-        // abandons them, and those of the other connections on this thread,
-        // once the loop returns.
-        set_thread_end_reason(m_config->reconnect_on_error ? "max-reconnect-attempts-exceeded"
-                                                           : "connection-lost-no-reconnect");
-        // Break the event loop: the thread ends and run_benchmark() fails the
-        // run. It is not restarted.
-        event_base_loopbreak(m_event_base);
+        end_thread(reason,
+                   m_config->reconnect_on_error ? "max-reconnect-attempts-exceeded" : "connection-lost-no-reconnect");
     }
 }
 
@@ -2019,18 +2047,59 @@ bool shard_connection::run_is_over()
     return elapsed.tv_sec >= (time_t) m_config->test_time;
 }
 
-// A setup step (AUTH/SELECT/HELLO) was rejected. With --reconnect-on-error,
-// handle it like a dropped connection, so --max-reconnect-attempts bounds it.
-// Leaving the connection open would stall it for good: no workload request is
-// sent before setup completes, so --test-time / --requests are never checked
-// again, and --connection-stage-timeout is disarmed once the run has reached
-// steady state. Without --reconnect-on-error, a failure at startup is ended by
-// --connection-stage-timeout.
+// A setup step (AUTH/SELECT/HELLO) was rejected. No workload request is sent
+// before setup completes, so a connection left open with a rejected setup
+// would stall for good, and keep its client from ending (#737).
+// - With --reconnect-on-error, handle it like a dropped connection, so
+//   --max-reconnect-attempts bounds it.
+// - A replica connection under --read-preference primary is not needed: keyed
+//   requests go to the primaries, and so do the keyless ones the replica
+//   connection would have sent. Close it with a warning, and leave it closed:
+//   a slot map refresh does not redial it as a replica. It is not counted as a
+//   connection error, since memtier chose to drop it and the run is complete.
+// - Otherwise, once the run has reached steady state, end this thread, so
+//   the run fails. Unlike a dropped connection, this does not wait for peers
+//   still in their setup: the server rejected this one, and it stays needed.
+//   Before steady state the rejection is a startup failure that
+//   --connection-stage-timeout ends. That timeout is disarmed when any
+//   connection, on any thread, reaches steady state, so check again every
+//   second rather than wait to be told from another thread.
 void shard_connection::reconnect_after_setup_error(const char *error_context)
 {
     if (m_config->reconnect_on_error) {
         attempt_reconnect(error_context);
         m_setup_rejected = m_reconnecting;
+        return;
+    }
+    if (m_role == role_replica && m_config->read_preference == rp_primary) {
+        benchmark_error_log("warning: %s on replica connection %s; it is not needed under --read-preference "
+                            "primary, closing it.\n",
+                            error_context, get_readable_id());
+        disconnect();
+        m_setup_rejected_replica = true;
+        return;
+    }
+    m_setup_rejected_context = error_context;
+    handle_setup_rejected_check_event();
+}
+
+void shard_connection::handle_setup_rejected_check_event()
+{
+    if (m_setup_rejected_context == NULL || get_connection_state() != conn_connected) return;
+    if (connection_stage_steady_state_reached() || m_conns_manager->get_reqs_answered()) {
+        char reason[256];
+        snprintf(reason, sizeof(reason), "%s and --reconnect-on-error is not set", m_setup_rejected_context);
+        count_connection_error();
+        end_thread(reason, "connection-lost-no-reconnect");
+        return;
+    }
+    if (m_setup_rejected_timer == NULL) {
+        m_setup_rejected_timer = event_new(m_event_base, -1, 0, setup_rejected_check_cb, this);
+    }
+    struct timeval delay = {1, 0};
+    if (m_setup_rejected_timer == NULL || event_add(m_setup_rejected_timer, &delay) != 0) {
+        benchmark_error_log("error: failed to arm the timer in handle_setup_rejected_check_event\n");
+        event_base_loopbreak(m_event_base);
     }
 }
 

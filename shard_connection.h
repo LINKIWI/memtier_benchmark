@@ -148,6 +148,7 @@ class shard_connection
     friend void cluster_client_timer_handler(evutil_socket_t fd, short what, void *ctx);
     friend void deferred_fill_pipeline_cb(evutil_socket_t fd, short what, void *ctx);
     friend void cluster_slots_retry_cb(evutil_socket_t fd, short what, void *ctx);
+    friend void setup_rejected_check_cb(evutil_socket_t fd, short what, void *ctx);
     friend void cluster_client_read_handler(bufferevent *bev, void *ctx);
     friend void cluster_client_event_handler(bufferevent *bev, short events, void *ctx);
 
@@ -166,10 +167,14 @@ public:
     // allows another attempt, schedule a reconnect with backoff; otherwise
     // end this thread.
     void attempt_reconnect(const char *error_context);
+    void count_connection_error();
+    void disconnect_after_error();
+    void end_thread(const char *reason, const char *thread_end_reason);
     void reconnect_after_setup_error(const char *error_context);
     bool run_is_over();
     void retry_cluster_slots_after_error();
     void handle_cluster_slots_retry_event();
+    void handle_setup_rejected_check_event();
 
     void send_wait_command(struct timeval *sent_time, unsigned int num_slaves, unsigned int timeout);
     void send_set_command(struct timeval *sent_time, const char *key, int key_len, const char *value, int value_len,
@@ -210,6 +215,11 @@ public:
 
     enum connection_state get_connection_state() { return m_connection_state; }
     bool is_reconnect_pending() const { return m_reconnecting; }
+    // A replica connection closed because the server rejected its setup
+    // under --read-preference primary. The replica path of a slot map refresh
+    // does not redial it; a refresh that makes the node a primary dials it
+    // through the primary path, where reconnect_after_setup_error() applies.
+    bool is_setup_rejected_replica() const { return m_setup_rejected_replica; }
 
     // Topology role accessors. Defaults to role_primary; cluster_client flips
     // replicas to role_replica after CLUSTER SLOTS reveals them.
@@ -461,6 +471,15 @@ private:
     bool m_reconnecting;
     // The pending reconnect follows a rejected setup step (AUTH/SELECT/HELLO).
     bool m_setup_rejected;
+    // See is_setup_rejected_replica(). Never reset: it lasts as long as this
+    // object (kept across disconnect() and role changes). handle_cluster_slots()
+    // matches replicas by address, so it always names the same endpoint.
+    bool m_setup_rejected_replica;
+    // Without --reconnect-on-error: the setup step the server rejected on this
+    // still-open connection, while the run has not reached steady state. It is
+    // read when the re-check timer fires, so it must point to static storage
+    // (a string literal), never to a formatted buffer.
+    const char *m_setup_rejected_context;
     const char *m_thread_end_reason;
 
     // Connection timeout tracking
@@ -488,6 +507,10 @@ private:
 
     // Resends CLUSTER SLOTS after an empty, error or rejected reply at startup.
     struct event *m_cluster_slots_retry_timer;
+
+    // Checks once a second whether a connection left open with a rejected
+    // setup must now end the thread (reconnect_after_setup_error()).
+    struct event *m_setup_rejected_timer;
 
     // Tracks whether the bufferevent was paused via bufferevent_disable(EV_READ|
     // EV_WRITE) by fill_pipeline's idle-disable branch. fill_pipeline used to

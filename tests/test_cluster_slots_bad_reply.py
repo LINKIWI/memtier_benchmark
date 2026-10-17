@@ -7,6 +7,8 @@ memtier used to log "cluster slot failed" and never ask again: the connection
 sent no more requests, so the run hung past --test-time and --requests. At
 startup it must ask again, without charging the wait to the run; mid-run it
 must reconnect with --reconnect-on-error, or else fail the run.
+
+test_connection_setup_rejected reuses the scripted _Node and _run().
 """
 import socketserver
 import subprocess
@@ -21,7 +23,8 @@ class _Node(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
     def __init__(self, bad_slots_replies, moved_after=0, bad_reply=b"*0\r\n", replica=None, readonly_delay=0,
-                 first_good=False, bad_delay=0, auth_error=None):
+                 first_good=False, bad_delay=0, auth_error=None, auth_error_with_next=False, select_error=None,
+                 moved_every=0, auth_reject_first=0, first_data_delay=0):
         super().__init__(("127.0.0.1", 0), _Handler)
         self.lock = threading.Lock()
         # CLUSTER SLOTS requests answered with bad_reply: the ones after the
@@ -34,8 +37,25 @@ class _Node(socketserver.ThreadingTCPServer):
         self.first_good = first_good
         # How long to wait before sending bad_reply.
         self.bad_delay = bad_delay
-        # Reply to AUTH, if not +OK.
+        # Reply to AUTH, if not +OK, and whether to send it together with
+        # the next reply, as a server answering a pipelined setup does.
         self.auth_error = auth_error
+        self.auth_error_with_next = auth_error_with_next
+        # Reject only the first auth_reject_first AUTH requests (all if 0).
+        self.auth_reject_first = auth_reject_first
+        # How long to wait before the first data reply.
+        self.first_data_delay = first_data_delay
+        # More nodes for _run() to serve, beside replica.
+        self.extra = []
+        # Reply to SELECT, if not +OK.
+        self.select_error = select_error
+        # Answer every moved_every-th data command with -MOVED to moved_to
+        # (this node if None), so memtier refreshes the slot map again and again.
+        self.moved_every = moved_every
+        self.moved_to = None
+        # Replaces slots_reply() when set: called with this node.
+        self.slots_fn = None
+        self.auth_requests = 0
         # A node listed as this node's replica in a good reply, and how long
         # a node waits before answering READONLY.
         self.replica = replica
@@ -45,6 +65,10 @@ class _Node(socketserver.ThreadingTCPServer):
         self.errors = []
 
     def slots_reply(self):
+        if self.slots_fn is not None:
+            with self.lock:
+                self.slots_requests += 1
+            return self.slots_fn(self)
         with self.lock:
             self.slots_requests += 1
             n = self.slots_requests
@@ -64,6 +88,7 @@ class _Node(socketserver.ThreadingTCPServer):
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
         node = self.server
+        held = b""
         try:
             while True:
                 line = self.rfile.readline()
@@ -76,23 +101,40 @@ class _Handler(socketserver.StreamRequestHandler):
                 verb = args[0].upper()
                 if verb == b"CLUSTER":
                     reply = node.slots_reply()
+                elif verb == b"SELECT" and node.select_error:
+                    reply = node.select_error
                 elif verb == b"AUTH" and node.auth_error:
-                    reply = node.auth_error
+                    with node.lock:
+                        node.auth_requests += 1
+                        rejected = not node.auth_reject_first or node.auth_requests <= node.auth_reject_first
+                    if not rejected:
+                        reply = b"+OK\r\n"
+                    elif node.auth_error_with_next:
+                        held = node.auth_error
+                        continue
+                    else:
+                        reply = node.auth_error
                 elif verb == b"READONLY":
                     time.sleep(node.readonly_delay)
                     reply = b"+OK\r\n"
                 elif verb in (b"SET", b"GET"):
                     with node.lock:
                         node.data_requests += 1
-                        moved = node.data_requests == node.moved_after
+                        moved = node.data_requests == node.moved_after or \
+                            (node.moved_every and node.data_requests % node.moved_every == 0)
+                        first = node.data_requests == 1
+                    if first:
+                        time.sleep(node.first_data_delay)
                     if moved:
-                        reply = "-MOVED 0 127.0.0.1:{}\r\n".format(node.server_address[1]).encode()
+                        target = node.moved_to or node
+                        reply = "-MOVED 0 127.0.0.1:{}\r\n".format(target.server_address[1]).encode()
                     else:
                         reply = b"+OK\r\n" if verb == b"SET" else b"$-1\r\n"
                 else:
                     reply = b"+OK\r\n"
-                self.wfile.write(reply)
+                self.wfile.write(held + reply)
                 self.wfile.flush()
+                held = b""
         except (ConnectionResetError, BrokenPipeError):
             pass
         except Exception as error:
@@ -100,7 +142,7 @@ class _Handler(socketserver.StreamRequestHandler):
 
 
 def _run(node, extra_args, timeout=20, workers=1, clients=1, cluster=True, start_fraction=None):
-    others = [node.replica] if node.replica else []
+    others = ([node.replica] if node.replica else []) + node.extra
     threads = [threading.Thread(target=n.serve_forever, daemon=True) for n in [node] + others]
     for thread in threads:
         thread.start()
