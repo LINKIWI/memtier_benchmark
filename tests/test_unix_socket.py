@@ -166,4 +166,4 @@ if __name__ == '__main__':
     for name, test in list(globals().items()):
         if name.startswith('test_'):
             setattr(UnixSocketTests, name, lambda self, test=test: test(self))
-    unittest.main()
+    unittest.main(defaultTest="UnixSocketTests")
