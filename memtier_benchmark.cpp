@@ -225,6 +225,16 @@ static bool g_worker_failed = false;
 // error has been printed; main() then exits 1.
 static bool g_output_failed = false;
 
+// main owns the JSON writer. Workers never write JSON, and main writes results
+// after joining them, so the exit callback sees a quiescent writer. Close only
+// content already emitted, including benchmark results if verification exits.
+static json_handler *g_json_out_file = NULL;
+
+static void close_json_out_file_at_exit(void)
+{
+    if (g_json_out_file != NULL) g_json_out_file->close();
+}
+
 // Forward declarations
 struct cg_thread;
 static void print_client_list(FILE *fp, int pid, const char *timestr);
@@ -3318,6 +3328,8 @@ void usage()
         "Imported Data Options:\n"
         "      --data-import=FILE         Read object data from file\n"
         "      --data-verify              Enable data verification when test is complete\n"
+        "                                 (exit status 1 if verification fails, is incomplete,\n"
+        "                                 or verifies no key)\n"
         "      --verify-only              Only perform --data-verify, without any other test\n"
         "      --generate-keys            Generate keys for imported objects\n"
         "      --no-expiry                Ignore expiry information in imported data\n"
@@ -5859,6 +5871,12 @@ int main(int argc, char *argv[])
         jsonhandler = new json_handler((const char *) cfg.json_out_file);
         // We always print the configuration to the JSON file
         config_print_to_json(jsonhandler, &cfg);
+        if (atexit(close_json_out_file_at_exit) != 0) {
+            fprintf(stderr, "error: cannot register JSON output cleanup.\n");
+            delete jsonhandler;
+            exit(1);
+        }
+        g_json_out_file = jsonhandler;
     }
 
     if (cfg.out_file != NULL) {
@@ -5870,8 +5888,7 @@ int main(int argc, char *argv[])
         struct stat st;
         if (fstat(fileno(outfile), &st) == 0 && S_ISREG(st.st_mode) && ftruncate(fileno(outfile), 0) != 0) {
             fprintf(stderr, "error: cannot truncate --out-file %s: %s\n", cfg.out_file, strerror(errno));
-            // Close the JSON nesting, so the --json-out-file stays valid.
-            delete jsonhandler;
+            // The exit handler finishes the JSON nesting.
             exit(1);
         }
     } else {
@@ -6045,6 +6062,7 @@ int main(int argc, char *argv[])
     }
 
     // If needed, data verification is done now...
+    bool verify_failed = false;
     if (cfg.data_verify) {
         struct event_base *verify_event_base = event_base_new();
         abstract_protocol *verify_protocol = protocol_factory(cfg.protocol);
@@ -6067,6 +6085,19 @@ int main(int argc, char *argv[])
             jsonhandler->write_obj("keys verified successfuly", "%-10llu", client->get_verified_keys());
             jsonhandler->write_obj("keys failed", "%-10llu", client->get_errors());
             jsonhandler->close_nesting();
+        }
+
+        const unsigned long long verified_keys = client->get_verified_keys();
+        const unsigned long long failed_keys = client->get_errors();
+        if (failed_keys > 0) {
+            fprintf(stderr, "error: %llu of %llu keys failed verification\n", failed_keys, verified_keys + failed_keys);
+            verify_failed = true;
+        } else if (verified_keys == 0) {
+            fprintf(stderr, "error: no keys were verified\n");
+            verify_failed = true;
+        } else if (!client->verification_complete()) {
+            fprintf(stderr, "error: data verification did not complete\n");
+            verify_failed = true;
         }
 
         // Clean up...
@@ -6108,6 +6139,7 @@ int main(int argc, char *argv[])
             fprintf(stderr, "error: failed writing --json-out-file %s: %s\n", cfg.json_out_file, strerror(json_err));
             g_output_failed = true;
         }
+        g_json_out_file = NULL;
         delete jsonhandler;
     }
 
@@ -6183,8 +6215,8 @@ int main(int argc, char *argv[])
     if (g_worker_failed) {
         return 1;
     }
-    // An output could not be written (see g_output_failed).
-    if (g_output_failed) {
+    // An output could not be written, or data verification failed.
+    if (g_output_failed || verify_failed) {
         return 1;
     }
     return 0;
