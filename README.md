@@ -391,6 +391,25 @@ without storing the imported keys. In one local measurement, this added
 about 3.9 seconds for a 488 MiB file containing two million items; the cost
 depends on file size and storage speed.
 
+### Data verification (`--data-verify`, `--verify-only`)
+
+With `--data-import=FILE`, `--data-verify` reads imported keys back after the
+benchmark and compares their values with the file. `--verify-only` runs only
+that verification pass. The existing text and JSON summaries count matching
+and failed keys.
+
+If any checked key is missing, has the wrong value, or returns an error,
+memtier prints `error: N of M keys failed verification` and exits with status
+**1**. A pass that verifies no key (for example, because the server is
+unreachable) prints `error: no keys were verified` and also exits with **1**.
+A connection lost after some successful replies also exits with **1** if the
+verification pass did not complete. Successful verification exits with **0**,
+unless another run or output error occurred. A benchmark connection-stage abort
+still takes precedence and exits with **2**. Import and verification remain
+unsupported in cluster mode.
+Imported keys that expire before verification count as missing; use
+`--no-expiry` to ignore expiry times in the import file when that is intended.
+
 ### Closed stdin, stdout or stderr
 
 If a benchmark run is started with stdin, stdout or stderr closed (for
