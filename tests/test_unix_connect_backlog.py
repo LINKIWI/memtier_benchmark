@@ -104,9 +104,11 @@ def run_case(env, mode, abstract_length=0):
                 '-n', '10', '--ratio=1:0', '--hide-histogram', '--json-out-file', output]
         if mode == 'reconnect':
             args += ['--reconnect-interval=2']
+        if mode == 'timeout-retry':
+            args += ['--reconnect-on-error', '--max-reconnect-attempts=1']
         if tls:
             args += ['--tls', '--tls-skip-verify']
-        if mode == 'timeout':
+        if mode in ('timeout', 'timeout-retry'):
             args += ['--connection-timeout=1']
         elif mode == 'stage':
             args += ['--connection-stage-timeout=1']
@@ -128,9 +130,11 @@ def run_case(env, mode, abstract_length=0):
                     result = json.load(stream)
                 env.assertEqual(result['ALL STATS']['Sets']['Count'], 40 if mode == 'recover' else 10)
                 env.assertNotContains('Connection timeout', stderr)
-            elif mode == 'timeout':
+            elif mode in ('timeout', 'timeout-retry'):
                 env.assertEqual(proc.returncode, 1, message=stderr)
                 env.assertContains('Connection timeout after 1 seconds', stderr)
+                if mode == 'timeout-retry':
+                    env.assertContains('Maximum reconnection attempts (1) exceeded', stderr)
                 with open(output) as stream:
                     result = json.load(stream)
                 # A pending SSL handshake must also stay idle while the
@@ -178,3 +182,7 @@ def test_abstract_backlog_timeout(env):
 
 def test_abstract_backlog_reconnect(env):
     run_case(env, 'reconnect', 40)
+
+
+def test_abstract_backlog_reconnect_limit(env):
+    run_case(env, 'timeout-retry', 40)
