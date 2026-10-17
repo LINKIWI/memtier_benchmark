@@ -323,13 +323,18 @@ shard_connection::shard_connection(unsigned int id, connections_manager *conns_m
         memset(m_unix_sockaddr, 0, sizeof(struct sockaddr_un));
         m_unix_sockaddr->sun_family = AF_UNIX;
 
-        // Consider any Unix socket path prefixed with @ an abstract socket.
-        // In this scenario, sun_path[0] must be a null byte, and addrlen should be terminated at
-        // exactly the socket name length; see the manpage for unix(7).
+#ifdef __linux__
+        // Linux abstract names include the leading NUL, but no terminator.
+        // Reject oversized names rather than connecting to a truncated name.
         if (m_config->unix_socket[0] == '@') {
-            strncpy(&m_unix_sockaddr->sun_path[1], &m_config->unix_socket[1], strlen(m_config->unix_socket) - 1);
-            m_unix_sockaddrlen = offsetof(struct sockaddr_un, sun_path) + strlen(m_config->unix_socket);
-        } else {
+            size_t name_len = strlen(m_config->unix_socket);
+            if (name_len <= sizeof(m_unix_sockaddr->sun_path)) {
+                memcpy(m_unix_sockaddr->sun_path + 1, m_config->unix_socket + 1, name_len - 1);
+                m_unix_sockaddrlen = offsetof(struct sockaddr_un, sun_path) + name_len;
+            }
+        } else
+#endif
+        {
             strncpy(m_unix_sockaddr->sun_path, m_config->unix_socket, sizeof(m_unix_sockaddr->sun_path) - 1);
             m_unix_sockaddrlen = sizeof(struct sockaddr_un);
         }
@@ -484,6 +489,11 @@ int shard_connection::setup_socket(struct connect_info *addr)
     int sockfd;
 
     if (m_unix_sockaddr != NULL) {
+        if (m_unix_sockaddrlen == 0) {
+            benchmark_error_log("error: abstract UNIX socket name is too long.\n");
+            errno = ENAMETOOLONG;
+            return -1;
+        }
         sockfd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (sockfd < 0) {
             return -1;

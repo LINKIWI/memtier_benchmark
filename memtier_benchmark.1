@@ -19,7 +19,12 @@ Same as \fB\-\-host\fR
 Server port (default: 6379)
 .TP
 \fB\-S\fR, \fB\-\-unix\-socket\fR=\fI\,SOCKET\/\fR
-UNIX Domain socket name (default: none)
+UNIX Domain socket name (default: none).
+On Linux, a leading @ selects the abstract namespace: @NAME connects to NAME
+without creating or looking up a filesystem entry. NAME may contain at most
+107 bytes (not characters); overlong abstract names are rejected, not truncated.
+Use ./@NAME to select a relative filesystem socket whose filename begins with @.
+On other platforms, @ has no special meaning and filesystem sockets behave as before.
 .TP
 \fB\-4\fR, \fB\-\-ipv4\fR
 Force IPv4 address resolution.
