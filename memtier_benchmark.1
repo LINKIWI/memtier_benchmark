@@ -283,7 +283,8 @@ any run exits 2.
 \fB\-\-thread\-conn\-start\-max\-jitter\-micros\fR=\fI\,NUM\/\fR Maximum jitter in microseconds between connection creation (default: 0)
 .TP
 \fB\-\-multi\-key\-get\fR=\fI\,NUM\/\fR
-Enable multi\-key get commands, up to NUM keys (default: 0).
+Enable multi\-key get commands, up to NUM keys (default: 0, max: 16777214).
+Each client preallocates about 272 bytes per key.
 In cluster mode, keys are probed from the key space so that all
 keys in one batch route to the same shard (no hash\-tag prefix).
 .TP

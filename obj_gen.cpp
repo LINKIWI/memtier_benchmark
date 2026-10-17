@@ -130,9 +130,13 @@ unsigned long long gaussian_noise::gaussian_distribution_range(double stddev, do
     if (median == 0) median = len / 2.0 + min + 0.5;
     if (stddev == 0) stddev = len / 6.0;
     assert(median > min && median < max);
+    // max + 1 in double: in unsigned long long it wraps to 0 for
+    // max == ULLONG_MAX and every sample would be rejected.
     do {
         val = gaussian_distribution(stddev) + median;
-    } while (val < min || val > max + 1);
+    } while (val < min || val > (double) max + 1);
+    // Converting a double >= 2^64 to unsigned long long is undefined.
+    if (val >= (double) max) return max;
     return val;
 }
 
@@ -369,11 +373,18 @@ void object_generator::set_key_zipf_distribution(double key_exp)
     }
 }
 
-// return a random number between r_min and r_max
+// return a random number between r_min and r_max.  get_random() yields 62
+// bits (get_random_max()), so this is only uniform for spans up to 2^62:
+// above that the result never exceeds r_min + 2^62 - 1, and spans that do not
+// divide 2^62 are biased toward the low part (as they always were).
 unsigned long long object_generator::random_range(unsigned long long r_min, unsigned long long r_max)
 {
     unsigned long long rn = m_random.get_random();
-    return (rn % (r_max - r_min + 1)) + r_min;
+    unsigned long long span = r_max - r_min + 1;
+    // A full 0..ULLONG_MAX range wraps span to 0 (rn % 0 is SIGFPE); every
+    // rn is in range then.
+    if (span == 0) return rn;
+    return (rn % span) + r_min;
 }
 
 // return a random number between r_min and r_max using normal distribution according to r_stddev
@@ -381,6 +392,15 @@ unsigned long long object_generator::normal_distribution(unsigned long long r_mi
                                                          double r_stddev, double r_median)
 {
     return m_random.gaussian_distribution_range(r_stddev, r_median, r_min, r_max);
+}
+
+// Convert a Zipf sample to a key: with --key-maximum near ULLONG_MAX the
+// double can reach 2^64, and converting that to unsigned long long is
+// undefined, so clamp to the range maximum as the Gaussian path does.
+static unsigned long long zipf_key(double k, unsigned long long max)
+{
+    if (k >= (double) max) return max;
+    return (unsigned long long) k;
 }
 
 // following sampler is based on:
@@ -402,8 +422,8 @@ unsigned long long object_generator::zipf_distribution()
             if (x < m_key_zipf_min - 0.5) x = m_key_zipf_min + 0.5;
             if (x >= m_key_zipf_max + 0.5) x = m_key_zipf_max;
             double k = floor(x + 0.5);
-            if (k - x <= m_key_zipf_s) return k;
-            if (u > log(k + 0.5) - 1. / k) return k;
+            if (k - x <= m_key_zipf_s) return zipf_key(k, m_key_zipf_max);
+            if (u > log(k + 0.5) - 1. / k) return zipf_key(k, m_key_zipf_max);
         }
     } else {
         while (true) {
@@ -413,9 +433,9 @@ unsigned long long object_generator::zipf_distribution()
             if (x < m_key_zipf_min - 0.5) x = m_key_zipf_min + 0.5;
             if (x >= m_key_zipf_max + 0.5) x = m_key_zipf_max;
             double k = floor(x + 0.5);
-            if (k - x <= m_key_zipf_s) return k;
+            if (k - x <= m_key_zipf_s) return zipf_key(k, m_key_zipf_max);
             double t = (u - pow(k + 0.5, m_key_zipf_1mexp));
-            if (m_key_zipf_1mexpInv * t > -pow(k, -m_key_zipf_exp)) return k;
+            if (m_key_zipf_1mexpInv * t > -pow(k, -m_key_zipf_exp)) return zipf_key(k, m_key_zipf_max);
         }
     }
 }
