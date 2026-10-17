@@ -147,3 +147,23 @@ def test_unix_abstract_socket_rejects_overlong_name(env):
                            message=result.stderr)
             env.assertEqual(peer.commands, [])
             env.assertEqual(peer.errors, [])
+
+
+if __name__ == '__main__':
+    # Also run on macOS build jobs without installing RLTest or starting Redis.
+    import unittest
+
+    class UnixSocketTests(unittest.TestCase):
+        def assertEqual(self, first, second, message=''):
+            super().assertEqual(first, second, message)
+
+        def assertTrue(self, value, message=''):
+            super().assertTrue(value, message)
+
+        def skip(self):
+            self.skipTest('abstract Unix sockets require Linux')
+
+    for name, test in list(globals().items()):
+        if name.startswith('test_'):
+            setattr(UnixSocketTests, name, lambda self, test=test: test(self))
+    unittest.main()
