@@ -101,6 +101,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 #include "client.h"
 #include "cluster_client.h"
 #include "JSON_handler.h"
+#include "utf8.h"
 #include "file_io.h"
 #include "obj_gen.h"
 #include "memtier_benchmark.h"
@@ -2643,6 +2644,12 @@ static int config_parse_args(int argc, char *argv[], struct benchmark_config *cf
             if (cfg->prometheus_run_labels.size() >= 16) {
                 fprintf(stderr, "error: --prometheus-run-label: too many labels (max 16).\n");
                 return -1;
+            }
+            if (utf8_sanitize(value.c_str()) != value) {
+                fprintf(stderr,
+                        "warning: --prometheus-run-label: value for '%s' is not valid UTF-8; "
+                        "invalid bytes are replaced with U+FFFD on /metrics.\n",
+                        key.c_str());
             }
             cfg->prometheus_run_labels.push_back(std::make_pair(key, value));
             break;
