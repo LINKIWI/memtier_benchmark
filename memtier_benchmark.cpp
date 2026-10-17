@@ -49,7 +49,6 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <sys/stat.h>
-#include <poll.h>
 #ifdef HAVE_EXECINFO_H
 #include <execinfo.h>
 #endif
@@ -218,6 +217,12 @@ static std::atomic<bool> g_any_run_connection_stage_aborted{false};
 // --requests). Such a run did not measure what was asked for; main() then
 // exits 1.
 static bool g_worker_failed = false;
+
+// Set (main thread only) when a requested output could not be opened or
+// written: --out-file, --json-out-file, stdout, the --hdr-file-prefix files,
+// the --client-stats CSVs or --failed-keys-file (e.g. a full disk). The
+// error has been printed; main() then exits 1.
+static bool g_output_failed = false;
 
 // Forward declarations
 struct cg_thread;
@@ -3098,7 +3103,8 @@ void usage()
         "                                 multi-key command (MGET, or several __key__ args) logs only its\n"
         "                                 first key. key and status are quoted, with \" doubled,\n"
         "                                 \\ written as \\\\ and non-printable bytes as \\xHH.\n"
-        "                                 Off by default. The benchmark continues if the file is unwritable.\n"
+        "                                 Off by default. Exits 1 at startup if the file cannot be opened;\n"
+        "                                 a later write error stops logging and the run exits 1.\n"
         "      --connection-timeout=SECS  Connection timeout in seconds, 0 to disable (default: 0)\n"
         "      --connection-stage-timeout=SECS\n"
         "                                 Abort with exit code 2 if no thread reaches steady state within\n"
@@ -4585,12 +4591,18 @@ run_stats run_benchmark(int run_id, benchmark_config *cfg, object_generator *obj
     // Do we need to produce client stats?
     if (cfg->client_stats != NULL) {
         unsigned int cg_id = 0;
+        unsigned int failures = 0;
         fprintf(stderr, "[RUN %u] Writing client stats files...\n", run_id);
         for (std::vector<cg_thread *>::iterator i = threads.begin(); i != threads.end(); i++) {
             char prefix[PATH_MAX];
 
             snprintf(prefix, sizeof(prefix) - 1, "%s-%u-%u", cfg->client_stats, run_id, cg_id++);
-            (*i)->m_cg->write_client_stats(prefix);
+            (*i)->m_cg->write_client_stats(prefix, &failures);
+        }
+        if (failures > 0) {
+            if (failures > 1)
+                fprintf(stderr, "error: %u more --client-stats files could not be written\n", failures - 1);
+            g_output_failed = true;
         }
     }
 
@@ -4718,27 +4730,30 @@ static void cleanup_openssl(void)
 
 #endif
 
-// True if the write error err on the still-open fp only means that the stdout
-// reader went away (e.g. `| head`): fp is stdout or the same file, a pipe or
-// socket, and the error is EPIPE/ECONNRESET (SIGPIPE is ignored). The EIO from
-// finish_output_file() hides the real errno, which may be EAGAIN on a full
-// stdout pipe made non-blocking by a parent sharing it (e.g. Node or a CI
-// runner), so for EIO poll(): POLLERR/POLLHUP means the reader is gone.
-static bool stdout_reader_gone(FILE *fp, int err)
+// --hdr-file-prefix and --client-stats files are only created when a run
+// ends. Check at startup that the directory they go into is a writable
+// directory (without creating anything), so a typo does not cost a whole run.
+// This is best-effort: access() uses the real UID, so as root or on an NFS
+// root_squash mount an unwritable directory can pass, and a full disk is only
+// seen at the end anyway. Exits 1 on failure.
+static void check_output_prefix_dir(const char *option, const char *prefix)
 {
-    if (err != EPIPE && err != ECONNRESET && err != EIO) return false;
-    int fd = fileno(fp);
-    struct stat st, out_st;
-    if (fstat(fd, &st) != 0 || !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) return false;
-    if (fp != stdout &&
-        (fstat(STDOUT_FILENO, &out_st) != 0 || st.st_dev != out_st.st_dev || st.st_ino != out_st.st_ino))
-        return false;
-    if (err != EIO) return true;
-    struct pollfd pfd;
-    pfd.fd = fd;
-    pfd.events = POLLOUT;
-    pfd.revents = 0;
-    return poll(&pfd, 1, 0) == 1 && (pfd.revents & (POLLERR | POLLHUP)) != 0;
+    std::string dir(prefix);
+    size_t slash = dir.rfind('/');
+    dir = slash == std::string::npos ? "." : (slash == 0 ? "/" : dir.substr(0, slash));
+    struct stat st;
+    int err = 0;
+    if (stat(dir.c_str(), &st) != 0) {
+        err = errno;
+    } else if (!S_ISDIR(st.st_mode)) {
+        err = ENOTDIR;
+    } else if (access(dir.c_str(), W_OK | X_OK) != 0) {
+        err = errno;
+    }
+    if (err != 0) {
+        fprintf(stderr, "error: cannot write %s directory %s: %s\n", option, dir.c_str(), strerror(err));
+        exit(1);
+    }
 }
 
 // Make sure fds 0, 1 and 2 are open before anything else opens a file.
@@ -5200,15 +5215,6 @@ int main(int argc, char *argv[])
                     cfg.key_median, cfg.key_minimum, cfg.key_maximum);
             exit(2);
         }
-    }
-
-    // Open the failed-keys log if requested. A path that cannot be opened is
-    // reported but doesn't abort the benchmark: the error is visible and the
-    // run is otherwise fine. A path that names a closed fd 0-2 was rejected
-    // after option parsing instead, because it opens fine (on /dev/null) and
-    // the log would be lost without any message.
-    if (cfg.failed_keys_file) {
-        global_failed_keys_logger().open(cfg.failed_keys_file);
     }
 
     // Validate staircase options (after defaults are applied)
@@ -5693,6 +5699,12 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
+    // --verify-only writes no HDR or --client-stats files.
+    if (!cfg.verify_only) {
+        if (cfg.hdr_prefix[0] != '\0') check_output_prefix_dir("--hdr-file-prefix", cfg.hdr_prefix);
+        if (cfg.client_stats != NULL) check_output_prefix_dir("--client-stats", cfg.client_stats);
+    }
+
     // Open the output files after option validation and data import, so a
     // startup error leaves existing files untouched. Retry on EINTR, as
     // json_handler does.
@@ -5706,6 +5718,16 @@ int main(int argc, char *argv[])
             fprintf(stderr, "error: cannot open --out-file %s: %s\n", cfg.out_file, strerror(errno));
             exit(1);
         }
+    }
+
+    // A --failed-keys-file that cannot be opened (or whose header cannot be
+    // written) fails now, as --out-file does, rather than after a whole run
+    // whose log would be lost. --out-file is not truncated yet, and
+    // --json-out-file not opened. A path that names a closed fd 0-2 was
+    // rejected after option parsing, because it opens fine (on /dev/null)
+    // and the log would be lost without any message.
+    if (cfg.failed_keys_file && !global_failed_keys_logger().open(cfg.failed_keys_file)) {
+        exit(1);
     }
 
     // JSON file initiation
@@ -5751,10 +5773,11 @@ int main(int argc, char *argv[])
 
             run_stats stats = run_benchmark(run_id, &cfg, obj_gen);
             all_stats.push_back(stats);
-            stats.save_hdr_full_run(&cfg, run_id);
-            stats.save_hdr_get_command(&cfg, run_id);
-            stats.save_hdr_set_command(&cfg, run_id);
-            stats.save_hdr_arbitrary_commands(&cfg, run_id);
+            // Each writer prints its own error; write the remaining files anyway.
+            if (!stats.save_hdr_full_run(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_get_command(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_set_command(&cfg, run_id)) g_output_failed = true;
+            if (!stats.save_hdr_arbitrary_commands(&cfg, run_id)) g_output_failed = true;
         }
         const bool series_cut = all_stats.size() < cfg.run_count;
         if (series_cut) {
@@ -5934,7 +5957,6 @@ int main(int argc, char *argv[])
     // stdout, e.g. /dev/stdout) on a pipe or socket whose reader went away,
     // e.g. `| head`. That is the reader's choice, not a lost result.
     // Keep this check after the last write to outfile.
-    bool output_failed = false;
     int out_err = finish_output_file(outfile, false);
     // Checked before fclose(), while the fd is still open.
     bool reader_gone = out_err != 0 && stdout_reader_gone(outfile, out_err);
@@ -5945,7 +5967,7 @@ int main(int argc, char *argv[])
         } else {
             fprintf(stderr, "error: failed writing --out-file %s: %s\n", cfg.out_file, strerror(out_err));
         }
-        output_failed = true;
+        g_output_failed = true;
     }
 
     if (cfg.server_addr) {
@@ -5961,9 +5983,18 @@ int main(int argc, char *argv[])
         int json_err = jsonhandler->close();
         if (json_err != 0) {
             fprintf(stderr, "error: failed writing --json-out-file %s: %s\n", cfg.json_out_file, strerror(json_err));
-            output_failed = true;
+            g_output_failed = true;
         }
         delete jsonhandler;
+    }
+
+    // On this normal path all worker threads are joined, so nothing logs
+    // failed keys any more and the log can be closed and checked. A record
+    // that could not be written was reported when it happened. The early
+    // exit(failure_exit_code()) paths skip both the join and this close (see
+    // global_failed_keys_logger()).
+    if (cfg.failed_keys_file && global_failed_keys_logger().close() != 0) {
+        g_output_failed = true;
     }
 
     delete obj_gen;
@@ -6029,8 +6060,8 @@ int main(int argc, char *argv[])
     if (g_worker_failed) {
         return 1;
     }
-    // The results could not be written (see above).
-    if (output_failed) {
+    // An output could not be written (see g_output_failed).
+    if (g_output_failed) {
         return 1;
     }
     return 0;

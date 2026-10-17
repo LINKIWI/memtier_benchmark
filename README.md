@@ -333,9 +333,33 @@ reader is still there (for example a full non-blocking pipe) still fails the
 run. Any other `--out-file` (for example a FIFO whose reader exits) and
 `--json-out-file` always fail the run when a write fails.
 
-Not covered yet: write errors on the HDR histogram files
-(`--hdr-file-prefix`), the `--client-stats` CSV files and
-`--failed-keys-file` are still not checked.
+The same rule covers the other output files:
+
+- `--failed-keys-file` is opened at startup, after option validation and
+  before connecting. If it cannot be opened, or its CSV header cannot be
+  written, memtier prints `error: cannot open --failed-keys-file PATH:
+  REASON` (or `failed writing`) and exits with status **1** right away, as
+  for `--out-file`. If a record cannot be written during the run, memtier
+  prints `error: failed writing --failed-keys-file PATH: REASON; logging
+  disabled.`, the benchmark goes on without the log, and memtier exits
+  with **1** at the end. A `--failed-keys-file` on stdout whose reader
+  went away (for example `/dev/stdout` and `| head`) only stops logging.
+- The HDR histogram files (`--hdr-file-prefix`) and the `--client-stats`
+  CSV files are only created when a run ends. At startup, before
+  connecting, memtier checks that the directory of each prefix exists and
+  is a writable directory (no file is created, and `--verify-only` skips
+  the check), and otherwise prints `error: cannot write --hdr-file-prefix
+  directory DIR: REASON` (or `--client-stats`) and exits with **1**. The
+  check is best-effort: it uses `access()`, which tests the real user ID,
+  so when running as root or on an NFS `root_squash` mount an unwritable
+  directory can still only be caught when the run ends. A full disk is
+  only seen when the run ends: if one of
+  these files cannot be opened or written then, memtier prints `error:
+  cannot open --hdr-file-prefix file PATH: REASON` or `error: failed
+  writing --client-stats file PATH: REASON`, still writes the other files,
+  and exits with **1**. For `--client-stats` only the first failing file of
+  a run is named, followed by `error: N more --client-stats files could not
+  be written`.
 
 A stdout that was already closed when memtier started is handled separately,
 see [Closed stdin, stdout or stderr](#closed-stdin-stdout-or-stderr).
@@ -373,9 +397,8 @@ Otherwise:
 - `--hdr-file-prefix` and `--client-stats` are prefixes: memtier always
   appends a suffix (`_FULL_RUN_1.txt`, `-1-0-0.csv`, ...), so they never
   name `/dev/stdout` or `/dev/fd/N` themselves. They are not checked. A
-  file they cannot open or write is reported but does not fail the run
-  yet; that known gap is tracked in
-  [#744](https://github.com/redis/memtier_benchmark/issues/744).
+  file they cannot open or write fails the run, see
+  [Output write errors](#output-write-errors).
 
 ## Crash Reporting
 

@@ -9,6 +9,7 @@ import os
 import fcntl
 import socket
 import struct
+import resource
 from include import *
 from mb import Benchmark, RunConfig
 
@@ -1924,7 +1925,7 @@ def test_startup_error_keeps_output_files_data_import(env):
 
 
 def _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file=False, prefix=None, requests=10,
-                   test_time=None):
+                   test_time=None, preexec_fn=None):
     """Start a short benchmark whose output goes to extra_args/stdout; return the Popen.
 
     The results and memtier's stderr (work_dir/memtier.stderr) go under
@@ -1950,7 +1951,7 @@ def _start_memtier(env, work_dir, extra_args, stdout, drop_default_out_file=Fals
         proc_env = dict(os.environ)
         proc_env['ASAN_OPTIONS'] = (proc_env.get('ASAN_OPTIONS', '') + ':verify_asan_link_order=0').lstrip(':')
     with open(_memtier_stderr_path(work_dir), 'wb') as stderr:
-        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=proc_env)
+        return subprocess.Popen(args, stdout=stdout, stderr=stderr, env=proc_env, preexec_fn=preexec_fn)
 
 
 def _memtier_stderr_path(work_dir):
@@ -2041,6 +2042,315 @@ def test_connection_stage_abort_keeps_rc_2_on_write_error(env):
     env.assertEqual(rc, 2, message=stderr)
     env.assertContains("aborting after", stderr)
     env.assertContains("error: failed writing --out-file /dev/full: No space left on device", stderr)
+
+
+def _symlink_to_dev_full(directory, names):
+    """Make each of names in directory a symlink to /dev/full; return their paths."""
+    paths = [os.path.join(directory, name) for name in names]
+    for path in paths:
+        os.symlink('/dev/full', path)
+    return paths
+
+
+def test_hdr_file_write_error(env):
+    """--hdr-file-prefix files that cannot be written fail the run (#744).
+
+    The names are built from the prefix, so a symlink to /dev/full stands in
+    for each one. This covers the .txt and .hgrm files of the full run and
+    of a command; the other files are still written.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as hdr_dir:
+        prefix = os.path.join(hdr_dir, 'h')
+        full = _symlink_to_dev_full(hdr_dir, ['h_FULL_RUN_1.txt', 'h_FULL_RUN_1.hgrm',
+                                              'h_SET_command_run_1.txt', 'h_GET_command_run_1.hgrm'])
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix], subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        for path in full:
+            env.assertContains("error: failed writing --hdr-file-prefix file {}: ".format(path), stderr)
+        for name in ['h_SET_command_run_1.hgrm', 'h_GET_command_run_1.txt']:
+            env.assertGreater(os.path.getsize(os.path.join(hdr_dir, name)), 0)
+
+
+def _check_one_hdr_file_fails(env, extra_args, name):
+    """Only the HDR file name fails (a /dev/full symlink); the run must still exit 1."""
+    with tempfile.TemporaryDirectory() as hdr_dir:
+        prefix = os.path.join(hdr_dir, 'h')
+        path, = _symlink_to_dev_full(hdr_dir, [name])
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix] + extra_args,
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=name + ': ' + stderr)
+        env.assertEqual(stderr.count("error: failed writing --hdr-file-prefix file"), 1, message=stderr)
+        env.assertContains("error: failed writing --hdr-file-prefix file {}: ".format(path), stderr)
+
+
+# One test per HDR writer, failing exactly one file at a time: the .txt
+# (first) and the .hgrm (second) file of each writer must both fail the run.
+
+def test_hdr_full_run_file_write_error(env):
+    """Only one full-run HDR file fails: the run exits 1 (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    for name in ['h_FULL_RUN_1.txt', 'h_FULL_RUN_1.hgrm']:
+        _check_one_hdr_file_fails(env, [], name)
+
+
+def test_hdr_set_command_file_write_error(env):
+    """Only one SET HDR file fails: the run exits 1 (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    for name in ['h_SET_command_run_1.txt', 'h_SET_command_run_1.hgrm']:
+        _check_one_hdr_file_fails(env, [], name)
+
+
+def test_hdr_get_command_file_write_error(env):
+    """Only one GET HDR file fails: the run exits 1 (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    for name in ['h_GET_command_run_1.txt', 'h_GET_command_run_1.hgrm']:
+        _check_one_hdr_file_fails(env, [], name)
+
+
+def test_hdr_arbitrary_command_file_write_error(env):
+    """Only one HDR file of a --command fails: the run exits 1 (#744).
+
+    The second command's files are used, so a failure that a later
+    command's success would hide is caught too.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    commands = ['--command', 'SET __key__ __data__', '--command', 'GET __key__']
+    for name in ['h_SET_command_run_1.txt', 'h_GET_command_run_1.txt', 'h_GET_command_run_1.hgrm']:
+        _check_one_hdr_file_fails(env, commands, name)
+
+
+def test_client_stats_write_error(env):
+    """A --client-stats CSV that cannot be written fails the run (#744)."""
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as stats_dir:
+        csv, = _symlink_to_dev_full(stats_dir, ['cs-1-0-0.csv'])
+        rc, stderr = _run_with_unwritable_output(env, ['--client-stats', os.path.join(stats_dir, 'cs')],
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: failed writing --client-stats file {}: No space left on device".format(csv),
+                           stderr)
+
+
+def test_hdr_file_prefix_missing_directory(env):
+    """An --hdr-file-prefix in a missing directory fails at startup (#744)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        missing = os.path.join(tmp_dir, 'missing')
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', os.path.join(missing, 'h')],
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot write --hdr-file-prefix directory {}: No such file or directory"
+                           .format(missing), stderr)
+        env.assertNotContains("Preparing benchmark client", stderr)
+
+
+def test_client_stats_missing_directory(env):
+    """A --client-stats prefix in a missing directory fails at startup (#744)."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        missing = os.path.join(tmp_dir, 'missing')
+        rc, stderr = _run_with_unwritable_output(env, ['--client-stats', os.path.join(missing, 'cs')],
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot write --client-stats directory {}: No such file or directory"
+                           .format(missing), stderr)
+        env.assertNotContains("Preparing benchmark client", stderr)
+
+
+def test_verify_only_skips_output_prefix_dir_check(env):
+    """--verify-only writes no HDR or --client-stats files, so their directories are not checked (#744)."""
+    if env.isCluster():  # --data-import (needed by --verify-only) is standalone only
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        missing = os.path.join(tmp_dir, 'missing')
+        data_import = os.path.join(tmp_dir, 'import.csv')
+        with open(data_import, 'w') as f:
+            f.write('dumpflags, time, exptime, nbytes, nsuffix, it_flags, clsid, nkey, key, data\n'
+                    '0, 0, 0, 7, 1, 0, 0, 3, "key", "value"\n')
+        rc, stderr = _run_with_unwritable_output(
+            env, ['--data-import', data_import, '--data-verify', '--verify-only',
+                  '--hdr-file-prefix', os.path.join(missing, 'h'), '--client-stats', os.path.join(missing, 'cs')],
+            subprocess.DEVNULL)
+        # Past the point where the directories would have been checked.
+        env.assertContains("Writing results to", stderr)
+        env.assertNotContains("directory {}".format(missing), stderr)
+        env.assertNotContains("cannot open", stderr)
+
+
+def test_output_prefix_dir_is_a_file(env):
+    """A regular file where the prefix directory should be fails at startup with ENOTDIR (#744).
+
+    Both with and without the execute bit, for both prefix options.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        not_dir = os.path.join(tmp_dir, 'not-a-dir')
+        with open(not_dir, 'w'):
+            pass
+        for mode in (0o755, 0o644):
+            os.chmod(not_dir, mode)
+            for option in ('--hdr-file-prefix', '--client-stats'):
+                rc, stderr = _run_with_unwritable_output(env, [option, os.path.join(not_dir, 'p')],
+                                                         subprocess.DEVNULL)
+                env.assertEqual(rc, 1, message=stderr)
+                env.assertContains("error: cannot write {} directory {}: Not a directory".format(option, not_dir),
+                                   stderr)
+                env.assertNotContains("Preparing benchmark client", stderr)
+
+
+def test_hdr_file_open_error(env):
+    """An HDR file that cannot be opened when the run ends fails the run (#744).
+
+    A directory in the file's place makes fopen() fail with EISDIR.
+    """
+    with tempfile.TemporaryDirectory() as hdr_dir:
+        prefix = os.path.join(hdr_dir, 'h')
+        os.mkdir(prefix + '_FULL_RUN_1.txt')
+        rc, stderr = _run_with_unwritable_output(env, ['--hdr-file-prefix', prefix], subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot open --hdr-file-prefix file {}_FULL_RUN_1.txt: Is a directory"
+                           .format(prefix), stderr)
+
+
+def test_client_stats_open_error_reported_once(env):
+    """--client-stats CSVs that cannot be opened fail the run, reported once (#744).
+
+    Only the first file is named, then the count of the others.
+    """
+    with tempfile.TemporaryDirectory() as stats_dir:
+        prefix = os.path.join(stats_dir, 'cs')
+        for i in range(3):
+            os.mkdir('{}-1-0-{}.csv'.format(prefix, i))
+        rc, stderr = _run_with_unwritable_output(env, ['--client-stats', prefix, '--clients', '3'],
+                                                 subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot open --client-stats file {}-1-0-0.csv: Is a directory".format(prefix),
+                           stderr)
+        env.assertEqual(stderr.count("error: cannot open --client-stats file"), 1, message=stderr)
+        env.assertContains("error: 2 more --client-stats files could not be written", stderr)
+
+
+def _run_with_oom_sets(env, extra_args, closed_stdout_pipe=False, **kwargs):
+    """Run SETs that all fail with -OOM, so each one is logged to --failed-keys-file."""
+    conns = env.getOSSMasterNodesConnectionList()
+    saved = [conn.execute_command('CONFIG', 'GET', 'maxmemory')[1] for conn in conns]
+    for conn in conns:
+        conn.execute_command('CONFIG', 'SET', 'maxmemory', '1')
+    try:
+        if closed_stdout_pipe:
+            return _closed_pipe_run(env, ['--ratio', '1:0'] + extra_args)
+        return _run_with_unwritable_output(env, ['--ratio', '1:0'] + extra_args, subprocess.DEVNULL, **kwargs)
+    finally:
+        for conn, value in zip(conns, saved):
+            conn.execute_command('CONFIG', 'SET', 'maxmemory', value)
+
+
+def test_failed_keys_file_missing_directory(env):
+    """A --failed-keys-file that cannot be opened fails at startup (#744), like --out-file."""
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = os.path.join(tmp_dir, 'missing', 'failed-keys.csv')
+        rc, stderr = _run_with_unwritable_output(env, ['--failed-keys-file', path], subprocess.DEVNULL)
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("error: cannot open --failed-keys-file {}: No such file or directory".format(path),
+                           stderr)
+        env.assertNotContains("Preparing benchmark client", stderr)
+
+
+def test_failed_keys_file_write_error(env):
+    """A --failed-keys-file whose header cannot be written fails at startup (#744).
+
+    The flush was not checked, so nothing reached the file and memtier
+    exited 0 without a message.
+    """
+    if not os.path.exists('/dev/full'):
+        env.skip()
+        return
+    rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', '/dev/full'])
+    env.assertEqual(rc, 1, message=stderr)
+    env.assertContains("error: failed writing --failed-keys-file /dev/full: No space left on device", stderr)
+    env.assertNotContains("Preparing benchmark client", stderr)
+
+
+def _file_size_limit_allowed(limit):
+    """True if this process may raise its own RLIMIT_FSIZE soft limit to limit."""
+    hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+    return hard == resource.RLIM_INFINITY or hard >= limit
+
+
+def _limit_file_size(limit):
+    """preexec_fn: cap the size of regular files the child writes; a write past it fails with EFBIG."""
+    def apply():
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+    return apply
+
+
+def _check_failed_keys_record_write_error(env, extra_args):
+    limit = 1 << 20
+    if not _file_size_limit_allowed(limit):
+        env.skip()
+        return
+    with tempfile.TemporaryDirectory() as log_dir:
+        path = os.path.join(log_dir, 'failed-keys.csv')
+        with open(path, 'w') as f:
+            f.write('timestamp,command,key,status,retries\n')
+            f.write('#' * (limit - f.tell() - 1) + '\n')
+        rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', path] + extra_args,
+                                        preexec_fn=_limit_file_size(limit))
+        env.assertEqual(rc, 1, message=stderr)
+        env.assertContains("Preparing benchmark client", stderr)
+        env.assertContains("error: failed writing --failed-keys-file {}: File too large; logging disabled."
+                           .format(path), stderr)
+        env.assertEqual(stderr.count("error: failed writing --failed-keys-file"), 1, message=stderr)
+        env.assertEqual(os.path.getsize(path), limit)
+
+
+def test_failed_keys_file_record_write_error(env):
+    """A failed-keys record that cannot be written fails the run at the end (#744).
+
+    The log already holds its header and is at RLIMIT_FSIZE, so opening it
+    works and every record fails with EFBIG. The other files stay far below
+    the limit. The run goes on without the log.
+    """
+    _check_failed_keys_record_write_error(env, [])
+
+
+def test_failed_keys_file_record_write_error_threads(env):
+    """Same, with 16 connections over 4 threads logging through the shared logger (#744)."""
+    _check_failed_keys_record_write_error(env, ['--threads', '4', '--clients', '4'])
+
+
+def test_failed_keys_file_stdout_reader_gone(env):
+    """A --failed-keys-file on stdout whose reader went away is not an error (#744).
+
+    Same rule as for the results on stdout (#719): only logging stops.
+    """
+    rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', '/dev/stdout'], closed_stdout_pipe=True)
+    env.assertEqual(rc, 0, message=stderr)
+    env.assertNotContains("--failed-keys-file", stderr)
+
+
+def test_failed_keys_file_written(env):
+    """The same -OOM run with a writable --failed-keys-file logs every key and exits 0."""
+    with tempfile.TemporaryDirectory() as log_dir:
+        path = os.path.join(log_dir, 'failed-keys.csv')
+        rc, stderr = _run_with_oom_sets(env, ['--failed-keys-file', path])
+        env.assertEqual(rc, 0, message=stderr)
+        with open(path) as f:
+            lines = f.read().splitlines()
+        env.assertEqual(lines[0], 'timestamp,command,key,status,retries')
+        env.assertEqual(len(lines), 11, message=stderr)
 
 
 def test_out_file_fifo_reader_exits_is_an_error(env):
