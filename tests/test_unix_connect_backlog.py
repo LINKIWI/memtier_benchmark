@@ -86,24 +86,31 @@ class BackloggedPeer:
             thread.join(timeout=2)
 
 
-def run_case(env, mode):
+def run_case(env, mode, abstract_length=0):
     if sys.platform != 'linux':
         env.skip()  # Deterministic backlog+1/EAGAIN behavior is Linux-specific.
     with tempfile.TemporaryDirectory(prefix='memtier-unix-backlog-') as tmp:
         path = os.path.join(tmp, 'server.sock')
+        cli_path = path
+        if abstract_length:
+            name = os.path.basename(tmp).ljust(abstract_length, 'x')
+            path = '\0' + name
+            cli_path = '@' + name
         output = os.path.join(tmp, 'result.json')
         tls = getattr(env, 'useTLS', False)
-        peer = BackloggedPeer(path, 0.4 if mode == 'recover' else None, tls)
-        args = [MEMTIER_BINARY, '-S', path, '-a', 'dummy-test-password',
+        peer = BackloggedPeer(path, 0.4 if mode in ('recover', 'reconnect') else None, tls)
+        args = [MEMTIER_BINARY, '-S', cli_path, '-a', 'dummy-test-password',
                 '-t', '1', '-c', '4' if mode == 'recover' else '1',
                 '-n', '10', '--ratio=1:0', '--hide-histogram', '--json-out-file', output]
+        if mode == 'reconnect':
+            args += ['--reconnect-interval=2']
         if tls:
             args += ['--tls', '--tls-skip-verify']
         if mode == 'timeout':
             args += ['--connection-timeout=1']
         elif mode == 'stage':
             args += ['--connection-stage-timeout=1']
-        elif mode == 'recover':
+        elif mode in ('recover', 'reconnect'):
             args += ['--connection-timeout=2']
         proc = None
         started = time.monotonic()
@@ -115,11 +122,11 @@ def run_case(env, mode):
             stdout, stderr = proc.communicate(timeout=8)
             stderr = stderr.decode(errors='replace')
             env.assertLess(time.monotonic() - started, 7, message=stderr)
-            if mode == 'recover':
+            if mode in ('recover', 'reconnect'):
                 env.assertEqual(proc.returncode, 0, message=stderr)
                 with open(output) as stream:
                     result = json.load(stream)
-                env.assertEqual(result['ALL STATS']['Sets']['Count'], 40)
+                env.assertEqual(result['ALL STATS']['Sets']['Count'], 40 if mode == 'recover' else 10)
                 env.assertNotContains('Connection timeout', stderr)
             elif mode == 'timeout':
                 env.assertEqual(proc.returncode, 1, message=stderr)
@@ -155,3 +162,19 @@ def test_unix_backlog_stage_timeout(env):
 
 def test_unix_backlog_interrupt(env):
     run_case(env, 'interrupt')
+
+
+def test_abstract_backlog_recovers(env):
+    run_case(env, 'recover', 40)
+
+
+def test_abstract_backlog_maximum_name(env):
+    run_case(env, 'recover', 107)
+
+
+def test_abstract_backlog_timeout(env):
+    run_case(env, 'timeout', 40)
+
+
+def test_abstract_backlog_reconnect(env):
+    run_case(env, 'reconnect', 40)

@@ -1,5 +1,5 @@
 memtier_benchmark
-=================
+==========
 ![GitHub](https://img.shields.io/github/license/redis/memtier_benchmark)
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/redis/memtier_benchmark)](https://github.com/redis/memtier_benchmark/releases)
 [![codecov](https://codecov.io/gh/redis/memtier_benchmark/branch/master/graph/badge.svg)](https://codecov.io/gh/redis/memtier_benchmark)
@@ -712,3 +712,14 @@ TLS over Unix sockets. The existing `--connection-timeout` and
 `--connection-stage-timeout` limits still apply. Setting both limits to zero
 imposes no connection-specific time bound. Other connection errors retain the
 normal reconnect policy.
+
+### Linux abstract Unix sockets
+
+On Linux, `memtier_benchmark --unix-socket @NAME` connects to an abstract Unix
+socket named `NAME`. No socket file or writable filesystem directory is needed.
+The name is limited to 107 bytes, excluding `@`; longer names fail instead of
+being silently truncated. The terminating NUL is not part of the abstract name.
+Use `--unix-socket ./@NAME` for a relative filesystem socket beginning with `@`.
+On other platforms, `@NAME` continues to be an ordinary filesystem pathname.
+Abstract sockets do not have filesystem permission checks; access control must
+be provided by the server (for example, Redis authentication).
