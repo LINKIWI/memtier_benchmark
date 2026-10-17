@@ -32,8 +32,10 @@ version.h:
 	$(SHELL) $(srcdir)/version.sh
 
 bin_PROGRAMS = memtier_benchmark
-completionsdir=$(BASH_COMPLETION_DIR)
-dist_completions_DATA=bash-completion/memtier_benchmark
+if INSTALL_BASH_COMPLETION
+completionsdir = $(BASH_COMPLETION_DIR)
+dist_completions_DATA = bash-completion/memtier_benchmark
+endif
 
 memtier_benchmark_CPPFLAGS = \
 	$(CODE_COVERAGE_CFLAGS) \
