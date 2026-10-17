@@ -686,6 +686,59 @@ static std::string prometheus_buckets_str(struct benchmark_config *cfg)
 }
 #endif // HAVE_EVHTTP
 
+// Secrets must not reach --show-config or --json-out-file (result files are
+// shared as CI artifacts). Keep the user name, which the redis and
+// memcache_binary authenticate() split off at the first ':', and replace the
+// password with "***": "user:pw" -> "user:***", "pw" -> "***".
+static std::string redact_credentials(const char *credentials)
+{
+    if (!credentials || !*credentials) return "";
+    const char *colon = strchr(credentials, ':');
+    if (!colon) return "***";
+    return std::string(credentials, colon - credentials + 1) + "***";
+}
+
+// End of the userinfo in a URI authority+path (the text after "scheme://"),
+// or NULL when there is none. The authority ends at a '/', '?' or '#'
+// (RFC 3986), so once credentials are present the search for '@' stops at
+// the first of those after the first '@': a later '@' in the db path, query
+// or fragment does not end the credentials, which would send them to another
+// host. It is the LAST '@' before that point, so a raw '@' in the password
+// works and no tail of it is taken for the host and echoed by --show-config
+// or a host/port error.
+// Known limits, both as before, until #732's percent-encoding:
+// - A raw '/', '?' or '#' in the password works only when no '@' comes
+//   before it in the password: "u:a@b/c@host" is split as host "b".
+// - Without credentials, an '@' in the path still ends a "userinfo":
+//   "host:6379/1@other:6379" connects to "other", and "host:6379/1@" to the
+//   default server. Treating a '/', '?' or '#' before the first '@' as "no
+//   userinfo" would break a raw '/' in passwords.
+static const char *uri_userinfo_end(const char *s)
+{
+    const char *at = strchr(s, '@');
+    if (!at) return NULL;
+    const char *delim = strpbrk(at, "/?#");
+    const char *end = delim ? delim : at + strlen(at);
+    while (end > at && *(end - 1) != '@')
+        end--;
+    return end - 1;
+}
+
+// --uri with its userinfo password redacted: redis://user:pw@host:port/db ->
+// redis://user:***@host:port/db. Splits where parse_uri() does; it assumes a
+// URI parse_uri() has already validated (the no-"://" fallback is only a guard).
+static std::string redact_uri(const char *uri)
+{
+    if (!uri) return "";
+    std::string s(uri);
+    size_t start = s.find("://");
+    start = (start == std::string::npos) ? 0 : start + 3;
+    const char *at = uri_userinfo_end(s.c_str() + start);
+    if (!at) return s;
+    size_t at_pos = at - s.c_str();
+    return s.substr(0, start) + redact_credentials(s.substr(start, at_pos - start).c_str()) + s.substr(at_pos);
+}
+
 static void config_print(FILE *file, struct benchmark_config *cfg)
 {
     char tmpbuf[512];
@@ -762,7 +815,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             "prometheus-latency-buckets = %s\n"
 #endif
             ,
-            cfg->server, cfg->port, cfg->uri ? cfg->uri : "", cfg->unix_socket,
+            cfg->server, cfg->port, redact_uri(cfg->uri).c_str(), cfg->unix_socket,
             cfg->resolution == AF_UNSPEC ? "Unspecified"
             : cfg->resolution == AF_INET ? "AF_INET"
                                          : "AF_INET6",
@@ -782,7 +835,7 @@ static void config_print(FILE *file, struct benchmark_config *cfg)
             cfg->retry_backoff_factor, cfg->retry_on_filter ? cfg->retry_on_filter : "", cfg->max_retry_queue,
             cfg->failed_keys_file ? cfg->failed_keys_file : "", cfg->connection_timeout, cfg->connection_stage_timeout,
             cfg->thread_conn_start_min_jitter_micros, cfg->thread_conn_start_max_jitter_micros, cfg->multi_key_get,
-            cfg->authenticate ? cfg->authenticate : "", cfg->select_db, cfg->no_expiry ? "yes" : "no",
+            redact_credentials(cfg->authenticate).c_str(), cfg->select_db, cfg->no_expiry ? "yes" : "no",
             cfg->wait_ratio.a, cfg->wait_ratio.b, cfg->num_slaves.min, cfg->num_slaves.max, cfg->wait_timeout.min,
             cfg->wait_timeout.max, cfg->json_out_file, cfg->print_all_runs ? "yes" : "no"
 #ifdef HAVE_EVHTTP
@@ -810,7 +863,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
 
     jsonhandler->write_obj("server", "\"%s\"", cfg->server);
     jsonhandler->write_obj("port", "%u", cfg->port);
-    jsonhandler->write_obj("uri", "\"%s\"", cfg->uri ? cfg->uri : "");
+    jsonhandler->write_obj("uri", "\"%s\"", redact_uri(cfg->uri).c_str());
     jsonhandler->write_obj("unix socket", "\"%s\"", cfg->unix_socket);
     jsonhandler->write_obj("address family", "\"%s\"",
                            cfg->resolution == AF_UNSPEC ? "Unspecified"
@@ -868,7 +921,7 @@ static void config_print_to_json(json_handler *jsonhandler, struct benchmark_con
     jsonhandler->write_obj("thread_conn_start_min_jitter_micros", "%u", cfg->thread_conn_start_min_jitter_micros);
     jsonhandler->write_obj("thread_conn_start_max_jitter_micros", "%u", cfg->thread_conn_start_max_jitter_micros);
     jsonhandler->write_obj("multi_key_get", "%u", cfg->multi_key_get);
-    jsonhandler->write_obj("authenticate", "\"%s\"", cfg->authenticate ? cfg->authenticate : "");
+    jsonhandler->write_obj("authenticate", "\"%s\"", redact_credentials(cfg->authenticate).c_str());
     jsonhandler->write_obj("select-db", "%d", cfg->select_db);
     jsonhandler->write_obj("no-expiry", "\"%s\"", cfg->no_expiry ? "true" : "false");
     jsonhandler->write_obj("wait-ratio", "\"%u:%u\"", cfg->wait_ratio.a, cfg->wait_ratio.b);
@@ -1096,8 +1149,9 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
 
     ptr = scheme_end + 3; // Skip "://"
 
-    // Parse user:password@host:port/db
-    char *auth_end = strchr(ptr, '@');
+    // Parse user:password@host:port/db; see uri_userinfo_end() for where the
+    // userinfo ends (redact_uri() splits at the same place).
+    char *auth_end = (char *) uri_userinfo_end(ptr);
     char *host_start = ptr;
 
     if (auth_end) {
@@ -1160,6 +1214,17 @@ static int parse_uri(const char *uri, struct benchmark_config *cfg, std::string 
             fprintf(stderr, "warning: both URI and --port specified, URI takes precedence.\n");
         }
         cfg->port = port;
+    }
+
+    // An empty host with no explicit --server/--unix-socket falls back to the
+    // default server, as before (parse_uri() runs before
+    // config_init_defaults(), so a non-NULL server or unix_socket here was
+    // given on the command line); say where the run goes. This includes a
+    // stray '@' after the path (redis://host:6379/1@), which reads as
+    // credentials "host:6379/1" with no host, as on master (#732).
+    if (strlen(host_start) == 0 && !cfg->server && !cfg->unix_socket) {
+        fprintf(stderr, "warning: --uri has no host; connecting to the default server localhost:%u.\n",
+                cfg->port ? cfg->port : 6379);
     }
 
     // Own URI hosts separately from a borrowed --server argument or the default.
