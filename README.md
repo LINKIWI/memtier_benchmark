@@ -709,6 +709,6 @@ mapping, threat model, and operational notes.
 When a Unix socket listener's accept queue is full, memtier retries the pending
 connect every 10 ms without blocking the worker event loop. This also applies to
 TLS over Unix sockets. The existing `--connection-timeout` and
-`--connection-stage-timeout` limits still apply; disabling both limits allows a
-pending connect to keep waiting until the listener accepts it or the run is
-interrupted. Other connection errors retain the normal reconnect policy.
+`--connection-stage-timeout` limits still apply. Setting both limits to zero
+imposes no connection-specific time bound. Other connection errors retain the
+normal reconnect policy.
