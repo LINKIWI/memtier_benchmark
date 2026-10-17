@@ -14,13 +14,16 @@ from include import MEMTIER_BINARY, TLS_CERT, TLS_KEY
 
 
 class BackloggedPeer:
-    def __init__(self, path, release_after=None, tls=False):
+    def __init__(self, path, release_after=None, tls=False, pause_after_set=False):
         self.path = path
         self.tls_context = None
         if tls:
             self.tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             self.tls_context.load_cert_chain(TLS_CERT, TLS_KEY or None)
         self.stop = threading.Event()
+        self.pause_accept = threading.Event()
+        self.accept_stopped = threading.Event()
+        self.pause_after_set = pause_after_set
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(path)
         self.listener.listen(1)
@@ -41,17 +44,20 @@ class BackloggedPeer:
     def accept(self, delay):
         if self.stop.wait(delay):
             return
-        while not self.stop.is_set():
-            try:
-                conn, _ = self.listener.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                return
-            self.sockets.append(conn)
-            thread = threading.Thread(target=self.respond, args=(conn,))
-            self.threads.append(thread)
-            thread.start()
+        try:
+            while not self.stop.is_set() and not self.pause_accept.is_set():
+                try:
+                    conn, _ = self.listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                self.sockets.append(conn)
+                thread = threading.Thread(target=self.respond, args=(conn,))
+                self.threads.append(thread)
+                thread.start()
+        finally:
+            self.accept_stopped.set()
 
     def respond(self, conn):
         conn.settimeout(0.2)
@@ -68,6 +74,18 @@ class BackloggedPeer:
                         size = int(stream.readline()[1:])
                         args.append(stream.read(size))
                         stream.read(2)
+                    if self.pause_after_set and args[0] == b'SET':
+                        self.pause_after_set = False
+                        self.pause_accept.set()
+                        if not self.accept_stopped.wait(2):
+                            raise RuntimeError('accept loop did not pause')
+                        # Saturate the queue before acknowledging the first
+                        # request, which triggers --reconnect-interval=1.
+                        for _ in range(2):
+                            blocker = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                            blocker.settimeout(1)
+                            blocker.connect(self.path)
+                            self.sockets.append(blocker)
                     conn.sendall(b'+OK\r\n' if args[0] in (b'AUTH', b'SET') else b'$-1\r\n')
         except (OSError, ValueError):
             pass
@@ -98,10 +116,16 @@ def run_case(env, mode, abstract_length=0):
             cli_path = '@' + name
         output = os.path.join(tmp, 'result.json')
         tls = getattr(env, 'useTLS', False)
-        peer = BackloggedPeer(path, 0.4 if mode in ('recover', 'reconnect') else None, tls)
+        peer = BackloggedPeer(path, 0.4 if mode in ('recover', 'reconnect', 'deadline') else None,
+                             tls, pause_after_set=(mode == 'deadline'))
         args = [MEMTIER_BINARY, '-S', cli_path, '-a', 'dummy-test-password',
                 '-t', '1', '-c', '4' if mode == 'recover' else '1',
                 '-n', '10', '--ratio=1:0', '--hide-histogram', '--json-out-file', output]
+        if mode == 'deadline':
+            args[args.index('-n'):args.index('-n') + 2] = []
+            args += ['--test-time=1', '--connection-timeout=0',
+                     '--connection-stage-timeout=0', '--reconnect-on-error',
+                     '--max-reconnect-attempts=0', '--reconnect-interval=1']
         if mode == 'reconnect':
             args += ['--reconnect-interval=2']
         if mode == 'timeout-retry':
@@ -140,6 +164,12 @@ def run_case(env, mode, abstract_length=0):
                 # A pending SSL handshake must also stay idle while the
                 # listener queue is full; a live write event busy-spins here.
                 env.assertLess(result['ALL STATS']['CPU']['cpu_cores_used'], 0.5)
+            elif mode == 'deadline':
+                env.assertEqual(proc.returncode, 0, message=stderr)
+                env.assertContains('run is over, not reconnecting', stderr)
+                with open(output) as stream:
+                    result = json.load(stream)
+                env.assertEqual(result['ALL STATS']['Sets']['Count'], 1)
             elif mode == 'stage':
                 env.assertEqual(proc.returncode, 2, message=stderr)
                 env.assertContains('connection-stage failures', stderr)
@@ -186,3 +216,7 @@ def test_abstract_backlog_reconnect(env):
 
 def test_abstract_backlog_reconnect_limit(env):
     run_case(env, 'timeout-retry', 40)
+
+
+def test_abstract_backlog_run_deadline(env):
+    run_case(env, 'deadline', 40)

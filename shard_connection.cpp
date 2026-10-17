@@ -600,6 +600,9 @@ int shard_connection::connect(struct connect_info *addr)
             // In particular, the SSL bufferevent must not try its handshake
             // on an unconnected, writable socket while the backlog is full.
             bufferevent_disable(m_bev, EV_READ | EV_WRITE);
+            // This is still one pending connect, not a failed reconnect
+            // attempt: EAGAIN must not consume --max-reconnect-attempts.
+            benchmark_debug_log("Unix socket listen queue full, waiting to connect\n");
             struct timeval delay = {0, 10000};
             m_unix_connect_timer = event_new(m_event_base, -1, EV_PERSIST, unix_connect_retry_cb, this);
             if (m_unix_connect_timer == NULL || event_add(m_unix_connect_timer, &delay) != 0) {
@@ -645,6 +648,13 @@ int shard_connection::connect(struct connect_info *addr)
 // Continue the same connect attempt: do not rearm its connection timeout.
 void shard_connection::handle_unix_connect_retry()
 {
+    // Apply the same timed-run policy as a failed asynchronous connect.
+    if (stops_at_deadline() && run_deadline_passed()) {
+        event_free(m_unix_connect_timer);
+        m_unix_connect_timer = NULL;
+        attempt_reconnect("Unix socket listen queue still full at run deadline");
+        return;
+    }
     if (bufferevent_socket_connect(m_bev, (struct sockaddr *) m_unix_sockaddr, m_unix_sockaddrlen) == 0) {
         event_free(m_unix_connect_timer);
         m_unix_connect_timer = NULL;
@@ -654,6 +664,8 @@ void shard_connection::handle_unix_connect_retry()
     const int error = errno;
     if (error == EAGAIN || error == EWOULDBLOCK) return;
 
+    event_free(m_unix_connect_timer);
+    m_unix_connect_timer = NULL;
     benchmark_error_log("connect failed, error = %s\n", strerror(error));
     attempt_reconnect("Unix socket connect failed");
 }

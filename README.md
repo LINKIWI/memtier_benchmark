@@ -711,7 +711,11 @@ connect every 10 ms without blocking the worker event loop. This also applies to
 TLS over Unix sockets. The existing `--connection-timeout` and
 `--connection-stage-timeout` limits still apply. Setting both limits to zero
 imposes no connection-specific time bound. Other connection errors retain the
-normal reconnect policy.
+normal reconnect policy. Once any connection reaches steady state, with
+`--reconnect-on-error` and unlimited reconnect attempts, `--test-time` also ends
+a backlog wait at the run deadline, as it does for other unsuccessful connects.
+Before steady state, the connection and setup-stage limits bound startup. `--debug` logs the start of a backlog wait once
+per connect attempt.
 
 ### Linux abstract Unix sockets
 
