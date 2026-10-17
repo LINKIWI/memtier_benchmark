@@ -109,6 +109,7 @@ static bool bitmask_is_contiguous(unsigned int mask);
 #include "latency_percentiles.h"
 #include "retry_policy.h"
 #include "statsd.h"
+#include "crash_report.h"
 #include "prometheus_metrics.h"
 #include "prometheus_exporter.h"
 
@@ -436,31 +437,84 @@ static const char *interrupt_source(void)
     return g_interrupted == SIGTERM ? "SIGTERM" : "user (Ctrl+C)";
 }
 
+// Offset of local time from UTC, in seconds, taken once at startup by
+// prewarm_crash_handler() with crash_utc_offset(). The crash handler cannot
+// call localtime(); see crash_report.h (#681).
+static long g_crash_utc_offset = 0;
+
+// Begin a report line: "[pid] timestr # ".
+static void crash_line_prefix(crash_line &l, int pid, const char *timestr)
+{
+    l.str("[");
+    l.num((long long) pid);
+    l.str("] ");
+    l.str(timestr);
+    l.str(" # ");
+}
+
+// ThreadSanitizer runs a handler for an asynchronous signal only when the
+// receiving thread is in, or leaves, an intercepted call. A thread stuck on
+// a futex or in a blocked write never does, so the watchdog handler would
+// never run and the process would hang. TSan builds keep SIG_DFL for
+// SIGALRM, which the kernel applies directly, and have no INCOMPLETE line.
+#if defined(__SANITIZE_THREAD__)
+#define MEMTIER_THREAD_SANITIZER 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MEMTIER_THREAD_SANITIZER 1
+#endif
+#endif
+
+#ifndef MEMTIER_THREAD_SANITIZER
+// SIGALRM handler armed by crash_handler(): say why the report stops, then
+// end the process with the default SIGALRM action as before. The write can
+// block too (stderr is a full pipe or a stopped tty), so first re-arm the
+// alarm: SA_RESETHAND already restored SIG_DFL, and SA_NODEFER leaves
+// SIGALRM unblocked, so the second alarm kills the process 1 s later.
+static void crash_watchdog_handler(int sig)
+{
+    alarm(1);
+    crash_line l;
+    l.str("\n=== MEMTIER_BENCHMARK BUG REPORT INCOMPLETE: crash handler timed out ===\n");
+    l.write_out();
+    // SA_RESETHAND already restored SIG_DFL, so this ends the process now.
+    raise(sig);
+}
+#endif
+
 // Crash handler - prints stack trace and other debugging information
 static void crash_handler(int sig, siginfo_t *info, void *secret)
 {
     (void) secret; // unused parameter
-    struct tm *tm;
-    time_t now;
     char timestr[64];
+    int pid = getpid();
 
     // Watchdog: if the handler itself hangs (e.g. mid-print_client_list while
     // iterating a torn vector under heap corruption), the process is killed
     // after 5 s instead of leaving a half-written report indefinitely. The
     // original signal will be re-raised on a fresh sigaction below, but if
-    // we never get there, SIGALRM provides the floor.
+    // we never get there, SIGALRM provides the floor. The watchdog first
+    // writes a line saying the report is incomplete. A second crash with the
+    // same signal takes the default action (SA_RESETHAND). A crash by a
+    // different signal re-enters this handler and re-arms alarm(5), so death
+    // can take up to about 11 s in that case, which is still bounded.
+#ifndef MEMTIER_THREAD_SANITIZER
+    struct sigaction alarm_act;
+    sigemptyset(&alarm_act.sa_mask);
+    alarm_act.sa_flags = SA_ONSTACK | SA_NODEFER | SA_RESETHAND;
+    alarm_act.sa_handler = crash_watchdog_handler;
+    // SIGALRM may land on any thread, not only this one. That is fine: the
+    // watchdog only calls alarm, write and raise, which are safe on any
+    // thread, and SA_RESETHAND resets the disposition for the whole process.
+    sigaction(SIGALRM, &alarm_act, NULL);
+#endif
     alarm(5);
 
-    // Get current time
-    now = time(NULL);
-    tm = localtime(&now);
-    strftime(timestr, sizeof(timestr), "%d %b %Y %H:%M:%S", tm);
+    // The header and signal details use only async-signal-safe calls
+    // (time, getpid, write), so they reach stderr even when the crash
+    // interrupted a thread holding the malloc, stdio or time zone lock.
+    crash_format_time(timestr, sizeof(timestr), (long long) time(NULL), g_crash_utc_offset);
 
-    // Print crash header
-    fprintf(stderr, "\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
-    fprintf(stderr, "[%d] %s # memtier_benchmark crashed by signal: %d\n", getpid(), timestr, sig);
-
-    // Print signal information
     const char *signal_name = "UNKNOWN";
     switch (sig) {
     case SIGSEGV:
@@ -479,12 +533,49 @@ static void crash_handler(int sig, siginfo_t *info, void *secret)
         signal_name = "SIGABRT";
         break;
     }
-    fprintf(stderr, "[%d] %s # Crashed running signal <%s>\n", getpid(), timestr, signal_name);
 
+    crash_line l;
+    l.str("\n\n=== MEMTIER_BENCHMARK BUG REPORT START: Cut & paste starting from here ===\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("memtier_benchmark crashed by signal: ");
+    l.num((long long) sig);
+    l.str("\n");
+    l.write_out();
+    crash_line_prefix(l, pid, timestr);
+    l.str("Crashed running signal <");
+    l.str(signal_name);
+    l.str(">\n");
+    l.write_out();
     if (info) {
-        fprintf(stderr, "[%d] %s # Signal code: %d\n", getpid(), timestr, info->si_code);
-        fprintf(stderr, "[%d] %s # Fault address: %p\n", getpid(), timestr, info->si_addr);
+        crash_line_prefix(l, pid, timestr);
+        l.str("Signal code: ");
+        l.num((long long) info->si_code);
+        l.str("\n");
+        l.write_out();
+        crash_line_prefix(l, pid, timestr);
+        l.str("Fault address: ");
+        if (info->si_addr == NULL) {
+            l.str("(nil)");
+        } else {
+            l.str("0x");
+            l.num((unsigned long long) (uintptr_t) info->si_addr, 16, 1);
+        }
+        l.str("\n");
+        l.write_out();
     }
+
+    // Everything below is best effort and is NOT async-signal-safe; it comes
+    // after the essential lines above so a hang here still leaves them, and
+    // the watchdog ends a hang after 5 s:
+    // - backtrace() can take the loader lock (dl_iterate_phdr) while
+    //   unwinding; its first-use malloc/dlopen is done by prewarm.
+    // - fprintf(stderr) takes the stderr FILE lock. It is recursive, so it
+    //   only blocks while another thread is inside a stderr call.
+    // - print_client_list() reads the worker's client and connection
+    //   vectors without synchronization; a torn vector can fault or hang.
+    // uname(), getpid(), sigaction() and raise() are async-signal-safe, and
+    // event_get_version() only returns a constant string.
 
     // Print stack trace for all threads
     print_all_threads_stack_trace(stderr, getpid(), timestr);
@@ -566,6 +657,10 @@ static void prewarm_crash_handler(void)
     fflush(stderr);
     // Resolve event_get_version too — used in the INFO section.
     (void) event_get_version();
+
+    // The handler formats its timestamp by hand from this offset, and this
+    // first localtime_r() call also loads the time zone data.
+    g_crash_utc_offset = crash_utc_offset(time(NULL));
 }
 
 // Setup crash handlers
@@ -593,10 +688,11 @@ static void setup_crash_handlers(void)
     sigaction(SIGFPE, &act, NULL);
     sigaction(SIGILL, &act, NULL);
     sigaction(SIGABRT, &act, NULL);
-    // SIGALRM is the handler's own watchdog; if alarm(5) fires we want the
-    // default action (terminate the process) rather than re-entering the
-    // handler. Explicitly request SIG_DFL so the user can't have overridden
-    // it inadvertently.
+    // SIGALRM is the crash handler's watchdog. SIG_DFL (terminate) is the
+    // baseline; crash_handler() installs crash_watchdog_handler, which
+    // prints an INCOMPLETE marker and falls back to SIG_DFL, before it calls
+    // alarm(5). Explicitly request SIG_DFL here so an inherited disposition
+    // cannot turn the watchdog off.
     struct sigaction alarm_act;
     sigemptyset(&alarm_act.sa_mask);
     alarm_act.sa_flags = 0;
